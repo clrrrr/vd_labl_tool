@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bundled binaries (download separately)
+vendor/ffmpeg
+vendor/ffmpeg.exe
+vendor/ffprobe
+vendor/ffprobe.exe

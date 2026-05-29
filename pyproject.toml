@@ -1,0 +1,15 @@
+[project]
+name = "video-label-tool"
+version = "0.1.0"
+description = "Annotate MP4/MOV videos by writing JSON into the file's comment metadata"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6,<7",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["video_label_tool*"]
