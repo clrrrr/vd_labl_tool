@@ -21,10 +21,12 @@ from PySide6.QtCore import (
     Qt,
     QThread,
     QThreadPool,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -42,6 +44,23 @@ from .metadata import Annotation, MetadataError, read_video_info, write_annotati
 from .project_info_dialog import ProjectInfoDialog
 
 VIDEO_SUFFIXES = {".mp4", ".mov"}
+
+
+def _is_listable_video(p: Path) -> bool:
+    """Filter for ``iterdir()`` — accept only user-facing video files.
+
+    Excludes anything starting with ``.`` (camera files never have leading
+    dots; on macOS ``._filename`` resource forks also get filtered out) and
+    in particular our own intermediate write/rename temp files
+    (``.{name}.writing.{hex}<ext>`` and ``.__renaming__{hex}<ext>``) which
+    would otherwise be picked up by the scanner if the previous run crashed
+    mid-write.
+    """
+    if not p.is_file():
+        return False
+    if p.name.startswith("."):
+        return False
+    return p.suffix.lower() in VIDEO_SUFFIXES
 
 
 def _fmt_size(n: int) -> str:
@@ -108,8 +127,7 @@ def rename_videos_to_factory_pattern(
     """
     try:
         videos = sorted(
-            [p for p in folder.iterdir()
-             if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES],
+            [p for p in folder.iterdir() if _is_listable_video(p)],
             key=lambda p: p.name.lower(),
         )
     except OSError:
@@ -189,19 +207,21 @@ class _ScanTask(QRunnable):
         self._signals.done.emit(self._gen, self._row, annotation, duration, err)
 
 
-class _PasteSaveSignals(QObject):
-    """Signals for the background paste-save worker."""
+class _PasteSaveWorker(QObject):
+    """Writes an annotation in a worker thread (used by right-click paste).
+
+    The ``finished`` signal carries ``(video_path, exception_or_none)``. Each
+    worker owns its own signal so signal/slot connections are scoped to a
+    single paste-save lifecycle and auto-disconnect cleanly when the worker
+    is destroyed (no accumulating subscriptions on a shared QObject).
+    """
+
     finished = Signal(object, object)  # (video_path, exception_or_none)
 
-
-class _PasteSaveWorker(QObject):
-    """Writes an annotation in a worker thread (used by right-click paste)."""
-
-    def __init__(self, video_path: Path, annotation: Annotation, signals: _PasteSaveSignals):
+    def __init__(self, video_path: Path, annotation: Annotation):
         super().__init__()
         self._video_path = video_path
         self._annotation = annotation
-        self._signals = signals
 
     def run(self) -> None:
         err: Exception | None = None
@@ -209,7 +229,7 @@ class _PasteSaveWorker(QObject):
             write_annotation(self._video_path, self._annotation)
         except Exception as e:  # noqa: BLE001 — surfaced to the UI
             err = e
-        self._signals.finished.emit(self._video_path, err)
+        self.finished.emit(self._video_path, err)
 
 
 # --- Model ------------------------------------------------------------------
@@ -365,8 +385,6 @@ class FileListView(QWidget):
 
         # Track active paste-save workers so they aren't garbage collected
         # mid-flight. Keyed by file path.
-        self._paste_save_signals = _PasteSaveSignals(self)
-        self._paste_save_signals.finished.connect(self._on_paste_save_finished)
         self._active_saves: dict[Path, tuple[QThread, _PasteSaveWorker]] = {}
 
         self.model = VideoTableModel(self)
@@ -447,7 +465,7 @@ class FileListView(QWidget):
             initial_factory_id=self._factory_id or "",
             initial_factory_name=self._factory_name or "",
         )
-        if dlg.exec() != dlg.Accepted:
+        if dlg.exec() != QDialog.Accepted:
             return False
         new_id, new_name = dlg.values()
         id_changed = new_id != self._factory_id
@@ -507,8 +525,7 @@ class FileListView(QWidget):
         # Discover video files (non-recursive, sorted by name for predictability).
         try:
             entries = sorted(
-                [p for p in self._folder.iterdir()
-                 if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES],
+                [p for p in self._folder.iterdir() if _is_listable_video(p)],
                 key=lambda p: p.name.lower(),
             )
         except OSError:
@@ -637,11 +654,11 @@ class FileListView(QWidget):
             self._refresh_counts_label()
 
         thread = QThread(self)
-        worker = _PasteSaveWorker(row.path, new_anno, self._paste_save_signals)
+        worker = _PasteSaveWorker(row.path, new_anno)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        # Tear down the thread after the worker reports back.
-        self._paste_save_signals.finished.connect(thread.quit)
+        worker.finished.connect(self._on_paste_save_finished)
+        worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         self._active_saves[row.path] = (thread, worker)
@@ -660,5 +677,4 @@ class FileListView(QWidget):
     def _flash_status(self, message: str, ms: int = 2500) -> None:
         """Temporarily overlay a message on the counts label."""
         self.lbl_counts.setText(message)
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(ms, self._refresh_counts_label)

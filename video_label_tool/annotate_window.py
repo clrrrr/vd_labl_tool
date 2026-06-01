@@ -383,6 +383,14 @@ class AnnotateWindow(QDialog):
     # --- Window lifecycle ---------------------------------------------------
 
     def closeEvent(self, event):  # noqa: N802 — Qt API
+        # If a save is in progress, refuse to close. Otherwise the worker
+        # would emit finished into a dialog the user thinks is gone (a stray
+        # error message could pop up later, and accept() on a hidden dialog
+        # is confusing). The form is already disabled via _set_busy, so the
+        # user is just waiting a few seconds at most.
+        if self._save_thread is not None and self._save_thread.isRunning():
+            event.ignore()
+            return
         # Ensure player releases the file when the window closes (any path).
         self.player.stop()
         self.player.setSource(QUrl())
