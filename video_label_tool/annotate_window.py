@@ -70,12 +70,19 @@ class AnnotateWindow(QDialog):
 
     SPEED_OPTIONS = [("0.5x", 0.5), ("1.0x", 1.0), ("1.5x", 1.5), ("2.0x", 2.0)]
 
-    def __init__(self, video_path: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        video_path: Path,
+        parent: QWidget | None = None,
+        *,
+        prefilled_parts: list[str] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._video_path = video_path
         self._save_thread: QThread | None = None
         self._save_worker: _SaveWorker | None = None
         self._user_dragging = False
+        self._prefilled_parts = list(prefilled_parts) if prefilled_parts else []
 
         self.setWindowTitle(S.ANNO_TITLE_TEMPLATE.format(filename=video_path.name))
         self.resize(1100, 650)
@@ -219,10 +226,14 @@ class AnnotateWindow(QDialog):
             existing = read_annotation(self._video_path)
         except MetadataError:
             existing = None
-        if existing is None:
+        if existing is not None:
+            self.edt_process.setText(existing.process_name)
+            for p in existing.parts_involved:
+                self.lst_parts.addItem(QListWidgetItem(p))
             return
-        self.edt_process.setText(existing.process_name)
-        for p in existing.parts_involved:
+        # No annotation on disk — if the caller supplied a prefilled parts
+        # list (right-click paste onto an un-annotated video), use it.
+        for p in self._prefilled_parts:
             self.lst_parts.addItem(QListWidgetItem(p))
 
     def _load_video(self) -> None:

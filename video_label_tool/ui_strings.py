@@ -13,14 +13,23 @@ LABEL_COUNT_TEMPLATE = "共 {total} 个视频 · 已标注 {done} · 未标注 {
 COL_FILENAME = "文件名"
 COL_STATUS = "状态"
 COL_PROCESS_NAME = "Process Name"
+COL_DURATION = "时长"
 COL_SIZE = "大小"
 COL_MTIME = "修改时间"
 
 # Status values
 STATUS_SCANNING = "扫描中…"
+STATUS_SAVING = "保存中…"
 STATUS_DONE = "已标注"
 STATUS_TODO = "未标注"
 STATUS_ERROR = "读取失败"
+
+# Context menu
+MENU_COPY_PARTS = "复制物品清单"
+MENU_PASTE_PARTS = "粘贴物品清单"
+MENU_PASTE_PARTS_TEMPLATE = "粘贴物品清单 ({n} 项)"
+TOAST_PARTS_COPIED = "已复制 {n} 个物品到剪贴板"
+TOAST_PARTS_PASTED = "已粘贴到 {filename}"
 
 # Annotate window
 ANNO_TITLE_TEMPLATE = "标注 — {filename}"

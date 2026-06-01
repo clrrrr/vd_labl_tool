@@ -21,10 +21,17 @@ class MainWindow(QMainWindow):
 
         self.file_list = FileListView(self)
         self.file_list.video_double_clicked.connect(self._open_annotate_window)
+        self.file_list.paste_to_unannotated.connect(self._open_annotate_window_with_prefill)
         self.setCentralWidget(self.file_list)
 
     def _open_annotate_window(self, path: Path) -> None:
-        dlg = AnnotateWindow(path, self)
+        self._show_annotate(path, prefilled_parts=None)
+
+    def _open_annotate_window_with_prefill(self, path: Path, parts: list) -> None:
+        self._show_annotate(path, prefilled_parts=list(parts))
+
+    def _show_annotate(self, path: Path, *, prefilled_parts: list | None) -> None:
+        dlg = AnnotateWindow(path, self, prefilled_parts=prefilled_parts)
         dlg.setWindowModality(Qt.ApplicationModal)
         dlg.exec()
         # After save/cancel, re-read this file's status so the row updates.

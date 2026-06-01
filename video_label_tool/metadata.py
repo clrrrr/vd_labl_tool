@@ -107,6 +107,17 @@ def read_annotation(video_path: Path) -> Annotation | None:
     or the JSON doesn't match the expected schema. Returns None on ffprobe
     failures too — caller should treat that as "unannotated".
     """
+    info = read_video_info(video_path)
+    return info[0]
+
+
+def read_video_info(video_path: Path) -> tuple[Annotation | None, float | None]:
+    """Read both the annotation and the duration (seconds) in one ffprobe call.
+
+    Returns ``(annotation_or_None, duration_or_None)``. Either field is None
+    on missing/invalid/probe-failure — callers should fall back gracefully.
+    Using a single ffprobe invocation per file matters for large folders.
+    """
     ffprobe = ffbin.ffprobe_path()
     if not ffprobe:
         raise MetadataError("ffprobe binary not found")
@@ -114,28 +125,42 @@ def read_annotation(video_path: Path) -> Annotation | None:
     cmd = [
         ffprobe,
         "-v", "error",
-        "-show_entries", "format_tags=comment",
+        "-show_entries", "format=duration:format_tags=comment",
         "-of", "json",
         str(video_path),
     ]
     try:
         result = _run(cmd, timeout=60)
     except subprocess.TimeoutExpired:
-        return None
+        return None, None
 
     if result.returncode != 0:
-        return None
+        return None, None
 
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
-        return None
+        return None, None
 
-    comment = data.get("format", {}).get("tags", {}).get("comment")
-    if not isinstance(comment, str):
-        return None
+    fmt = data.get("format", {})
+    tags = fmt.get("tags", {}) if isinstance(fmt, dict) else {}
 
-    return Annotation.from_comment(comment)
+    annotation: Annotation | None = None
+    comment = tags.get("comment") if isinstance(tags, dict) else None
+    if isinstance(comment, str):
+        annotation = Annotation.from_comment(comment)
+
+    duration: float | None = None
+    dur_raw = fmt.get("duration") if isinstance(fmt, dict) else None
+    if isinstance(dur_raw, (int, float)):
+        duration = float(dur_raw)
+    elif isinstance(dur_raw, str):
+        try:
+            duration = float(dur_raw)
+        except ValueError:
+            duration = None
+
+    return annotation, duration
 
 
 def write_annotation(video_path: Path, annotation: Annotation) -> None:

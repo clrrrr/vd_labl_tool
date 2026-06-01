@@ -14,17 +14,21 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QObject,
+    QPoint,
     QRunnable,
     Qt,
+    QThread,
     QThreadPool,
     Signal,
 )
-from PySide6.QtGui import QBrush, QColor, QFont
+from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QTableView,
     QVBoxLayout,
@@ -32,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import ui_strings as S
-from .metadata import Annotation, MetadataError, read_annotation
+from .metadata import Annotation, MetadataError, read_video_info, write_annotation
 
 VIDEO_SUFFIXES = {".mp4", ".mov"}
 
@@ -52,6 +56,18 @@ def _fmt_mtime(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
 
 
+def _fmt_duration(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return ""
+    total = int(round(seconds))
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
 @dataclass
 class VideoRow:
     path: Path
@@ -59,18 +75,19 @@ class VideoRow:
     mtime: float
     status: str  # one of S.STATUS_*
     annotation: Annotation | None = None  # populated when status == STATUS_DONE
+    duration_seconds: float | None = None  # filled in by the scan task
 
 
 # --- Worker -----------------------------------------------------------------
 
 class _ScanSignals(QObject):
     """Signals owned by a QObject so they can be emitted across threads."""
-    done = Signal(int, int, object, object)
-    # (generation, row, annotation_or_none, exception_or_none)
+    done = Signal(int, int, object, object, object)
+    # (generation, row, annotation_or_none, duration_or_none, exception_or_none)
 
 
 class _ScanTask(QRunnable):
-    """Reads a single video's annotation in a worker thread."""
+    """Reads a single video's annotation and duration in a worker thread."""
 
     def __init__(self, generation: int, row: int, path: Path, signals: _ScanSignals):
         super().__init__()
@@ -82,14 +99,38 @@ class _ScanTask(QRunnable):
 
     def run(self) -> None:
         annotation: Annotation | None = None
+        duration: float | None = None
         err: Exception | None = None
         try:
-            annotation = read_annotation(self._path)
+            annotation, duration = read_video_info(self._path)
         except MetadataError as e:
             err = e
         except Exception as e:  # noqa: BLE001 — worker thread must not propagate
             err = e
-        self._signals.done.emit(self._gen, self._row, annotation, err)
+        self._signals.done.emit(self._gen, self._row, annotation, duration, err)
+
+
+class _PasteSaveSignals(QObject):
+    """Signals for the background paste-save worker."""
+    finished = Signal(object, object)  # (video_path, exception_or_none)
+
+
+class _PasteSaveWorker(QObject):
+    """Writes an annotation in a worker thread (used by right-click paste)."""
+
+    def __init__(self, video_path: Path, annotation: Annotation, signals: _PasteSaveSignals):
+        super().__init__()
+        self._video_path = video_path
+        self._annotation = annotation
+        self._signals = signals
+
+    def run(self) -> None:
+        err: Exception | None = None
+        try:
+            write_annotation(self._video_path, self._annotation)
+        except Exception as e:  # noqa: BLE001 — surfaced to the UI
+            err = e
+        self._signals.finished.emit(self._video_path, err)
 
 
 # --- Model ------------------------------------------------------------------
@@ -97,10 +138,18 @@ class _ScanTask(QRunnable):
 COL_FILENAME = 0
 COL_STATUS = 1
 COL_PROCESS = 2
-COL_SIZE = 3
-COL_MTIME = 4
+COL_DURATION = 3
+COL_SIZE = 4
+COL_MTIME = 5
 
-_HEADERS = [S.COL_FILENAME, S.COL_STATUS, S.COL_PROCESS_NAME, S.COL_SIZE, S.COL_MTIME]
+_HEADERS = [
+    S.COL_FILENAME,
+    S.COL_STATUS,
+    S.COL_PROCESS_NAME,
+    S.COL_DURATION,
+    S.COL_SIZE,
+    S.COL_MTIME,
+]
 
 
 class VideoTableModel(QAbstractTableModel):
@@ -132,10 +181,14 @@ class VideoTableModel(QAbstractTableModel):
                 return row.status
             if col == COL_PROCESS:
                 return row.annotation.process_name if row.annotation else ""
+            if col == COL_DURATION:
+                return _fmt_duration(row.duration_seconds)
             if col == COL_SIZE:
                 return _fmt_size(row.size)
             if col == COL_MTIME:
                 return _fmt_mtime(row.mtime)
+        elif role == Qt.TextAlignmentRole and col == COL_DURATION:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
         elif role == Qt.ForegroundRole and col == COL_STATUS:
             if row.status == S.STATUS_DONE:
                 return QBrush(QColor("#1b7f3b"))  # green
@@ -169,11 +222,29 @@ class VideoTableModel(QAbstractTableModel):
         self.endResetModel()
 
     def update_row_status(self, row: int, status: str, annotation: Annotation | None) -> None:
+        """For transient states (SCANNING/SAVING) — keeps existing duration."""
         if 0 <= row < len(self._rows):
             self._rows[row].status = status
             self._rows[row].annotation = annotation
             top = self.index(row, COL_STATUS)
             bot = self.index(row, COL_PROCESS)
+            self.dataChanged.emit(top, bot, [Qt.DisplayRole, Qt.ForegroundRole, Qt.FontRole])
+
+    def update_row_after_scan(
+        self,
+        row: int,
+        status: str,
+        annotation: Annotation | None,
+        duration: float | None,
+    ) -> None:
+        """For scan-completion — replaces annotation and duration together."""
+        if 0 <= row < len(self._rows):
+            r = self._rows[row]
+            r.status = status
+            r.annotation = annotation
+            r.duration_seconds = duration
+            top = self.index(row, COL_STATUS)
+            bot = self.index(row, COL_DURATION)
             self.dataChanged.emit(top, bot, [Qt.DisplayRole, Qt.ForegroundRole, Qt.FontRole])
 
     def status_counts(self) -> tuple[int, int, int]:
@@ -188,6 +259,10 @@ class FileListView(QWidget):
     """Top-level widget: folder picker + video table."""
 
     video_double_clicked = Signal(Path)
+    # Emitted when user pastes a parts list onto an un-annotated video; carries
+    # (path, parts_list). The main window opens the annotate dialog pre-filled
+    # so the user can supply the Process Name before saving.
+    paste_to_unannotated = Signal(Path, list)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -198,6 +273,16 @@ class FileListView(QWidget):
 
         self._scan_signals = _ScanSignals(self)
         self._scan_signals.done.connect(self._on_scan_done)
+
+        # In-memory clipboard for the right-click copy/paste-parts feature.
+        # Just app-internal — does not touch the OS clipboard.
+        self._parts_clipboard: list[str] | None = None
+
+        # Track active paste-save workers so they aren't garbage collected
+        # mid-flight. Keyed by file path.
+        self._paste_save_signals = _PasteSaveSignals(self)
+        self._paste_save_signals.finished.connect(self._on_paste_save_finished)
+        self._active_saves: dict[Path, tuple[QThread, _PasteSaveWorker]] = {}
 
         self.model = VideoTableModel(self)
 
@@ -238,9 +323,12 @@ class FileListView(QWidget):
         hh.setSectionResizeMode(COL_FILENAME, QHeaderView.Stretch)
         hh.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(COL_PROCESS, QHeaderView.Stretch)
+        hh.setSectionResizeMode(COL_DURATION, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(COL_SIZE, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(COL_MTIME, QHeaderView.ResizeToContents)
         self.table.doubleClicked.connect(self._on_double_clicked)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
         root.addWidget(self.table, 1)
 
     # --- Public API ---------------------------------------------------------
@@ -310,16 +398,21 @@ class FileListView(QWidget):
             self._pool.start(_ScanTask(gen, i, r.path, self._scan_signals))
 
     def _on_scan_done(
-        self, gen: int, row: int, annotation: Annotation | None, err: Exception | None
+        self,
+        gen: int,
+        row: int,
+        annotation: Annotation | None,
+        duration: float | None,
+        err: Exception | None,
     ) -> None:
         if gen != self._generation:
             return  # stale result, ignore
         if err is not None:
-            self.model.update_row_status(row, S.STATUS_ERROR, None)
+            self.model.update_row_after_scan(row, S.STATUS_ERROR, None, duration)
         elif annotation is None:
-            self.model.update_row_status(row, S.STATUS_TODO, None)
+            self.model.update_row_after_scan(row, S.STATUS_TODO, None, duration)
         else:
-            self.model.update_row_status(row, S.STATUS_DONE, annotation)
+            self.model.update_row_after_scan(row, S.STATUS_DONE, annotation, duration)
         self._refresh_counts_label()
 
     def _on_double_clicked(self, index: QModelIndex) -> None:
@@ -338,3 +431,97 @@ class FileListView(QWidget):
             self.lbl_counts.setText(
                 S.LABEL_COUNT_TEMPLATE.format(total=total, done=done, todo=todo)
             )
+
+    # --- Context menu: copy / paste parts list ------------------------------
+
+    def _on_context_menu(self, pos: QPoint) -> None:
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        row = self.model.row_for_index(index)
+        if row is None:
+            return
+
+        menu = QMenu(self.table)
+
+        can_copy = row.status == S.STATUS_DONE and row.annotation is not None
+        act_copy = QAction(S.MENU_COPY_PARTS, menu)
+        act_copy.setEnabled(can_copy)
+        act_copy.triggered.connect(lambda: self._copy_parts(row))
+        menu.addAction(act_copy)
+
+        # Paste available when we have a buffer AND the target is not
+        # currently being scanned or saved.
+        clip = self._parts_clipboard
+        busy = row.status in (S.STATUS_SCANNING, S.STATUS_SAVING)
+        can_paste = clip is not None and not busy
+        label = (
+            S.MENU_PASTE_PARTS_TEMPLATE.format(n=len(clip)) if clip is not None
+            else S.MENU_PASTE_PARTS
+        )
+        act_paste = QAction(label, menu)
+        act_paste.setEnabled(can_paste)
+        act_paste.triggered.connect(lambda: self._paste_parts(row))
+        menu.addAction(act_paste)
+
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _copy_parts(self, row: VideoRow) -> None:
+        if row.annotation is None:
+            return
+        self._parts_clipboard = list(row.annotation.parts_involved)
+        # Brief feedback through the counts label so it doesn't block the user.
+        self._flash_status(S.TOAST_PARTS_COPIED.format(n=len(self._parts_clipboard)))
+
+    def _paste_parts(self, row: VideoRow) -> None:
+        if self._parts_clipboard is None:
+            return
+        parts = list(self._parts_clipboard)
+
+        if row.status != S.STATUS_DONE or row.annotation is None:
+            # Un-annotated target: punt to the main window so it can open the
+            # annotate dialog with the parts pre-filled, letting the user enter
+            # a Process Name before committing.
+            self.paste_to_unannotated.emit(row.path, parts)
+            return
+
+        # Annotated target: keep its Process Name, replace parts, save in the
+        # background. We don't need a file-lock dance here because nothing in
+        # the file list view holds an open handle on the file.
+        if row.path in self._active_saves:
+            return  # already saving this file
+        new_anno = Annotation(
+            process_name=row.annotation.process_name,
+            parts_involved=parts,
+        )
+        row_idx = self.model.find_row_by_path(row.path)
+        if row_idx >= 0:
+            self.model.update_row_status(row_idx, S.STATUS_SAVING, row.annotation)
+            self._refresh_counts_label()
+
+        thread = QThread(self)
+        worker = _PasteSaveWorker(row.path, new_anno, self._paste_save_signals)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        # Tear down the thread after the worker reports back.
+        self._paste_save_signals.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._active_saves[row.path] = (thread, worker)
+        thread.start()
+
+    def _on_paste_save_finished(self, video_path: Path, err: object) -> None:
+        self._active_saves.pop(video_path, None)
+        if err is not None:
+            QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, str(err))
+        # Re-read the file so the row reflects the new state (or the old one
+        # if the save failed).
+        self.rescan_path(video_path)
+        if err is None:
+            self._flash_status(S.TOAST_PARTS_PASTED.format(filename=video_path.name))
+
+    def _flash_status(self, message: str, ms: int = 2500) -> None:
+        """Temporarily overlay a message on the counts label."""
+        self.lbl_counts.setText(message)
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(ms, self._refresh_counts_label)
