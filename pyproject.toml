@@ -5,6 +5,7 @@ description = "Annotate MP4/MOV videos by writing JSON into the file's comment m
 requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.6,<7",
+    "openpyxl>=3.1,<4",
 ]
 
 [build-system]

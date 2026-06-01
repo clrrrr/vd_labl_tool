@@ -16,8 +16,11 @@ block_cipher = None
 PROJECT_ROOT = Path(SPECPATH).resolve()
 
 pyside_datas, pyside_binaries, pyside_hidden = collect_all('PySide6')
+# openpyxl has some lazy-imported submodules (notably openpyxl.cell._writer)
+# that PyInstaller's static analysis misses; collect_all sweeps them in.
+openpyxl_datas, openpyxl_binaries, openpyxl_hidden = collect_all('openpyxl')
 
-added_datas = list(pyside_datas) + [
+added_datas = list(pyside_datas) + list(openpyxl_datas) + [
     (str(PROJECT_ROOT / 'vendor' / 'ffmpeg.exe'), 'vendor'),
     (str(PROJECT_ROOT / 'vendor' / 'ffprobe.exe'), 'vendor'),
 ]
@@ -25,9 +28,9 @@ added_datas = list(pyside_datas) + [
 a = Analysis(
     ['main.py'],
     pathex=[str(PROJECT_ROOT)],
-    binaries=pyside_binaries,
+    binaries=pyside_binaries + openpyxl_binaries,
     datas=added_datas,
-    hiddenimports=pyside_hidden + [
+    hiddenimports=pyside_hidden + openpyxl_hidden + [
         'PySide6.QtMultimedia',
         'PySide6.QtMultimediaWidgets',
     ],

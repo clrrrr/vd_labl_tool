@@ -5,6 +5,7 @@ APP_TITLE = "视频标注工具"
 # Main window
 BTN_OPEN_FOLDER = "选择文件夹"
 BTN_REFRESH = "刷新"
+BTN_EXPORT_XLSX = "导出表格"
 BTN_PROJECT_INFO_PROMPT = "填写项目信息(必须)"
 BTN_PROJECT_INFO_TEMPLATE = "项目: {factory_id} · {factory_name} (修改)"
 LABEL_NO_FOLDER = "未选择文件夹"
@@ -22,6 +23,13 @@ DLG_PROJECT_INFO_VALIDATE_NAME = "工厂名不能为空"
 # Rename
 RENAME_WARNING_TITLE = "部分文件重命名失败"
 RENAME_WARNING_TEMPLATE = "以下文件无法重命名(已跳过):\n{lines}"
+
+# Export
+DLG_EXPORT_NOTHING_TITLE = "没有可导出内容"
+DLG_EXPORT_NOTHING_MSG = "当前没有视频可导出。先选择一个含视频的文件夹。"
+DLG_EXPORT_OK_TITLE = "导出成功"
+DLG_EXPORT_OK_TEMPLATE = "已导出 {count} 行到:\n{path}"
+DLG_EXPORT_FAIL_TITLE = "导出失败"
 
 # File list columns
 COL_FILENAME = "文件名"

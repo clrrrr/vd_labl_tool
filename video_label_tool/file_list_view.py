@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import ui_strings as S
+from .export import ExportRow, export_to_xlsx
 from .metadata import Annotation, MetadataError, read_video_info, write_annotation
 from .project_info_dialog import ProjectInfoDialog
 
@@ -88,6 +89,20 @@ def _fmt_duration(seconds: float | None) -> str:
     if h > 0:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def _extract_video_number(stem: str) -> str:
+    """Pull the trailing ``NNNNN`` out of a renamed filename stem.
+
+    Inputs like ``FAC123_00005`` → ``"00005"``. If the stem doesn't follow
+    the rename pattern (rare; only possible if the rename pass left
+    something behind), fall back to the whole stem so the row still has
+    *something* identifying it.
+    """
+    parts = stem.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[1]
+    return stem
 
 
 @dataclass
@@ -403,12 +418,16 @@ class FileListView(QWidget):
         self.btn_refresh = QPushButton(S.BTN_REFRESH)
         self.btn_refresh.clicked.connect(self._on_refresh)
         self.btn_refresh.setEnabled(False)
+        self.btn_export = QPushButton(S.BTN_EXPORT_XLSX)
+        self.btn_export.clicked.connect(self._on_export_xlsx)
+        self.btn_export.setEnabled(False)
         self.lbl_folder = QLabel(S.LABEL_NO_FOLDER)
         self.lbl_folder.setStyleSheet("color: #555;")
         self.lbl_folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
         top.addWidget(self.btn_project_info)
         top.addWidget(self.btn_open)
         top.addWidget(self.btn_refresh)
+        top.addWidget(self.btn_export)
         top.addSpacing(12)
         top.addWidget(self.lbl_folder, 1)
         root.addLayout(top)
@@ -496,11 +515,60 @@ class FileListView(QWidget):
         self._folder = Path(chosen)
         self.lbl_folder.setText(S.LABEL_FOLDER_PREFIX + str(self._folder))
         self.btn_refresh.setEnabled(True)
+        self.btn_export.setEnabled(True)
         self._prepare_and_scan_folder()
 
     def _on_refresh(self) -> None:
         if self._folder is not None and self._factory_id is not None:
             self._prepare_and_scan_folder()
+
+    def _on_export_xlsx(self) -> None:
+        if self._folder is None or self.model.rowCount() == 0:
+            QMessageBox.information(
+                self, S.DLG_EXPORT_NOTHING_TITLE, S.DLG_EXPORT_NOTHING_MSG,
+            )
+            return
+
+        # Build a default filename. ``QFileDialog.getSaveFileName`` handles
+        # special characters fine on each platform — no need to scrub.
+        if self._factory_id and self._factory_name:
+            default_stem = f"{self._factory_id}_{self._factory_name}"
+        else:
+            default_stem = self._folder.name or "videos"
+        default_path = str(self._folder / f"{default_stem}.xlsx")
+
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            S.BTN_EXPORT_XLSX,
+            default_path,
+            "Excel Workbook (*.xlsx)",
+        )
+        if not path_str:
+            return
+        out_path = Path(path_str)
+        if out_path.suffix.lower() != ".xlsx":
+            out_path = out_path.with_suffix(".xlsx")
+
+        rows = [
+            ExportRow(
+                video_number=_extract_video_number(r.path.stem),
+                process_name=(r.annotation.process_name if r.annotation else ""),
+                duration_text=_fmt_duration(r.duration_seconds),
+            )
+            for r in self.model._rows
+        ]
+
+        try:
+            export_to_xlsx(rows, out_path)
+        except Exception as e:  # noqa: BLE001 — surface any failure to the user
+            QMessageBox.critical(self, S.DLG_EXPORT_FAIL_TITLE, str(e))
+            return
+
+        QMessageBox.information(
+            self,
+            S.DLG_EXPORT_OK_TITLE,
+            S.DLG_EXPORT_OK_TEMPLATE.format(count=len(rows), path=str(out_path)),
+        )
 
     def _prepare_and_scan_folder(self) -> None:
         """Rename videos to the factory pattern, then trigger an async scan."""
