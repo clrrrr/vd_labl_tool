@@ -5,9 +5,24 @@ APP_TITLE = "视频标注工具"
 # Main window
 BTN_OPEN_FOLDER = "选择文件夹"
 BTN_REFRESH = "刷新"
+BTN_PROJECT_INFO_PROMPT = "填写项目信息(必须)"
+BTN_PROJECT_INFO_TEMPLATE = "项目: {factory_id} · {factory_name} (修改)"
+BTN_OPEN_FOLDER_DISABLED_TOOLTIP = "请先填写项目信息"
 LABEL_NO_FOLDER = "未选择文件夹"
 LABEL_FOLDER_PREFIX = "当前文件夹: "
 LABEL_COUNT_TEMPLATE = "共 {total} 个视频 · 已标注 {done} · 未标注 {todo}"
+
+# Project info dialog
+DLG_PROJECT_INFO_TITLE = "项目信息"
+DLG_PROJECT_INFO_FACTORY_ID = "工厂编号:"
+DLG_PROJECT_INFO_FACTORY_NAME = "工厂名:"
+DLG_PROJECT_INFO_HELP_ID = "字母、数字、下划线、连字符,1–30 字符"
+DLG_PROJECT_INFO_VALIDATE_ID = "工厂编号格式不合法"
+DLG_PROJECT_INFO_VALIDATE_NAME = "工厂名不能为空"
+
+# Rename
+RENAME_WARNING_TITLE = "部分文件重命名失败"
+RENAME_WARNING_TEMPLATE = "以下文件无法重命名(已跳过):\n{lines}"
 
 # File list columns
 COL_FILENAME = "文件名"

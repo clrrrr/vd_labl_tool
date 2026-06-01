@@ -7,6 +7,8 @@ thread never blocks on ffprobe.
 
 from __future__ import annotations
 
+import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from . import ui_strings as S
 from .metadata import Annotation, MetadataError, read_video_info, write_annotation
+from .project_info_dialog import ProjectInfoDialog
 
 VIDEO_SUFFIXES = {".mp4", ".mov"}
 
@@ -76,6 +79,82 @@ class VideoRow:
     status: str  # one of S.STATUS_*
     annotation: Annotation | None = None  # populated when status == STATUS_DONE
     duration_seconds: float | None = None  # filled in by the scan task
+
+
+# --- Rename -----------------------------------------------------------------
+
+def rename_videos_to_factory_pattern(
+    folder: Path,
+    factory_id: str,
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Rename every video in ``folder`` to ``{factory_id}_NNNNN<ext>``.
+
+    Ordering: original filenames sorted case-insensitively (matches the file
+    list view's display order). Index N is zero-padded to 5 digits starting
+    at 00000. The original extension is preserved verbatim (case included).
+
+    Idempotent — if all files already match their expected names, this does
+    nothing. When any rename is needed, all sources are first renamed to
+    unique temp names (``.__renaming__<hex>.<ext>``) and then to their final
+    targets. This two-phase shuffle avoids collisions when the new and old
+    names overlap (e.g. running with a different factory_id over an already
+    renamed folder).
+
+    Returns ``(final_paths_in_order, errors)`` where ``errors`` is a list of
+    ``(original_path, message)`` for any file that couldn't be renamed
+    (typically because of a Windows file lock or permission issue). Failed
+    files are left untouched; their original entry is omitted from
+    ``final_paths_in_order``.
+    """
+    try:
+        videos = sorted(
+            [p for p in folder.iterdir()
+             if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES],
+            key=lambda p: p.name.lower(),
+        )
+    except OSError:
+        return [], []
+
+    if not videos:
+        return [], []
+
+    targets = [
+        folder / f"{factory_id}_{i:05d}{p.suffix}"
+        for i, p in enumerate(videos)
+    ]
+    if all(p == t for p, t in zip(videos, targets)):
+        return list(videos), []  # already correctly named
+
+    # Phase 1: move every source to a unique temp name.
+    temps: list[tuple[Path, Path]] = []  # (temp_path, intended_target)
+    errors: list[tuple[Path, str]] = []
+    for src, tgt in zip(videos, targets):
+        if src == tgt:
+            # Already at the right name — skip both phases for this file.
+            temps.append((src, tgt))
+            continue
+        temp = folder / f".__renaming__{uuid.uuid4().hex[:12]}{src.suffix}"
+        try:
+            os.replace(src, temp)
+            temps.append((temp, tgt))
+        except OSError as e:
+            errors.append((src, str(e)))
+
+    # Phase 2: rename temps to their final targets.
+    final: list[Path] = []
+    for temp, tgt in temps:
+        if temp == tgt:
+            final.append(tgt)
+            continue
+        try:
+            os.replace(temp, tgt)
+            final.append(tgt)
+        except OSError as e:
+            errors.append((temp, str(e)))
+            # Leave the temp file in place rather than risk losing data —
+            # the user can recover it from disk.
+
+    return final, errors
 
 
 # --- Worker -----------------------------------------------------------------
@@ -271,6 +350,12 @@ class FileListView(QWidget):
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(8)
 
+        # Project info — set via the "填写项目信息" button. Must be filled
+        # before the user can pick a folder, since the folder selection step
+        # renames files using the factory_id.
+        self._factory_id: str | None = None
+        self._factory_name: str | None = None
+
         self._scan_signals = _ScanSignals(self)
         self._scan_signals.done.connect(self._on_scan_done)
 
@@ -293,14 +378,19 @@ class FileListView(QWidget):
         root = QVBoxLayout(self)
 
         top = QHBoxLayout()
+        self.btn_project_info = QPushButton(S.BTN_PROJECT_INFO_PROMPT)
+        self.btn_project_info.clicked.connect(self._on_project_info)
         self.btn_open = QPushButton(S.BTN_OPEN_FOLDER)
         self.btn_open.clicked.connect(self._on_open_folder)
+        self.btn_open.setEnabled(False)
+        self.btn_open.setToolTip(S.BTN_OPEN_FOLDER_DISABLED_TOOLTIP)
         self.btn_refresh = QPushButton(S.BTN_REFRESH)
         self.btn_refresh.clicked.connect(self._on_refresh)
         self.btn_refresh.setEnabled(False)
         self.lbl_folder = QLabel(S.LABEL_NO_FOLDER)
         self.lbl_folder.setStyleSheet("color: #555;")
         self.lbl_folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        top.addWidget(self.btn_project_info)
         top.addWidget(self.btn_open)
         top.addWidget(self.btn_refresh)
         top.addSpacing(12)
@@ -347,7 +437,35 @@ class FileListView(QWidget):
 
     # --- Slots --------------------------------------------------------------
 
+    def _on_project_info(self) -> None:
+        dlg = ProjectInfoDialog(
+            self,
+            initial_factory_id=self._factory_id or "",
+            initial_factory_name=self._factory_name or "",
+        )
+        if dlg.exec() != dlg.Accepted:
+            return
+        new_id, new_name = dlg.values()
+        id_changed = new_id != self._factory_id
+        self._factory_id = new_id
+        self._factory_name = new_name
+        self.btn_project_info.setText(
+            S.BTN_PROJECT_INFO_TEMPLATE.format(
+                factory_id=new_id, factory_name=new_name,
+            )
+        )
+        self.btn_open.setEnabled(True)
+        self.btn_open.setToolTip("")
+        # If the factory id changed and a folder is already loaded, re-rename
+        # so existing files line up with the new id before the next scan.
+        if id_changed and self._folder is not None:
+            self._prepare_and_scan_folder()
+
     def _on_open_folder(self) -> None:
+        if self._factory_id is None:
+            # Shouldn't normally happen — button is disabled — but defend.
+            self._on_project_info()
+            return
         start_dir = str(self._folder) if self._folder else str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, S.BTN_OPEN_FOLDER, start_dir)
         if not chosen:
@@ -355,11 +473,25 @@ class FileListView(QWidget):
         self._folder = Path(chosen)
         self.lbl_folder.setText(S.LABEL_FOLDER_PREFIX + str(self._folder))
         self.btn_refresh.setEnabled(True)
-        self._rescan_folder()
+        self._prepare_and_scan_folder()
 
     def _on_refresh(self) -> None:
-        if self._folder is not None:
-            self._rescan_folder()
+        if self._folder is not None and self._factory_id is not None:
+            self._prepare_and_scan_folder()
+
+    def _prepare_and_scan_folder(self) -> None:
+        """Rename videos to the factory pattern, then trigger an async scan."""
+        assert self._folder is not None
+        assert self._factory_id is not None
+        _, errors = rename_videos_to_factory_pattern(self._folder, self._factory_id)
+        if errors:
+            lines = "\n".join(f"  · {p.name}: {msg}" for p, msg in errors)
+            QMessageBox.warning(
+                self,
+                S.RENAME_WARNING_TITLE,
+                S.RENAME_WARNING_TEMPLATE.format(lines=lines),
+            )
+        self._rescan_folder()
 
     def _rescan_folder(self) -> None:
         assert self._folder is not None
