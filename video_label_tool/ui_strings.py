@@ -4,7 +4,6 @@ APP_TITLE = "视频标注工具"
 
 # Main window
 BTN_OPEN_FOLDER = "选择文件夹"
-BTN_REFRESH = "刷新"
 BTN_EXPORT_XLSX = "导出表格"
 BTN_PROJECT_INFO_PROMPT = "填写项目信息(必须)"
 BTN_PROJECT_INFO_TEMPLATE = "项目: {factory_id} · {factory_name} (修改)"

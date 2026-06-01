@@ -157,8 +157,21 @@ def rename_videos_to_factory_pattern(
     if not videos:
         return [], []
 
+    # Preserve any existing process-name suffix (the ``_工序名`` we appended on
+    # save). Without this, re-running the rename pass — e.g. after the user
+    # changes the factory id or re-selects the same folder — would silently
+    # strip the suffix and the file would lose its display name.
+    import re as _re
+    _suffix_re = _re.compile(r"^.*?_\d{5}(_.*)?$")
+
+    def _existing_suffix(stem: str) -> str:
+        m = _suffix_re.match(stem)
+        if m and m.group(1):
+            return m.group(1)
+        return ""
+
     targets = [
-        folder / f"{factory_id}_{i:05d}{p.suffix}"
+        folder / f"{factory_id}_{i:05d}{_existing_suffix(p.stem)}{p.suffix}"
         for i, p in enumerate(videos)
     ]
     if all(p == t for p, t in zip(videos, targets)):
@@ -427,9 +440,6 @@ class FileListView(QWidget):
         self.btn_project_info.clicked.connect(self._on_project_info)
         self.btn_open = QPushButton(S.BTN_OPEN_FOLDER)
         self.btn_open.clicked.connect(self._on_open_folder)
-        self.btn_refresh = QPushButton(S.BTN_REFRESH)
-        self.btn_refresh.clicked.connect(self._on_refresh)
-        self.btn_refresh.setEnabled(False)
         self.btn_export = QPushButton(S.BTN_EXPORT_XLSX)
         self.btn_export.clicked.connect(self._on_export_xlsx)
         self.btn_export.setEnabled(False)
@@ -438,7 +448,6 @@ class FileListView(QWidget):
         self.lbl_folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
         top.addWidget(self.btn_project_info)
         top.addWidget(self.btn_open)
-        top.addWidget(self.btn_refresh)
         top.addWidget(self.btn_export)
         top.addSpacing(12)
         top.addWidget(self.lbl_folder, 1)
@@ -535,13 +544,8 @@ class FileListView(QWidget):
             return
         self._folder = Path(chosen)
         self.lbl_folder.setText(S.LABEL_FOLDER_PREFIX + str(self._folder))
-        self.btn_refresh.setEnabled(True)
         self.btn_export.setEnabled(True)
         self._prepare_and_scan_folder()
-
-    def _on_refresh(self) -> None:
-        if self._folder is not None and self._factory_id is not None:
-            self._prepare_and_scan_folder()
 
     def _on_export_xlsx(self) -> None:
         if self._folder is None or self.model.rowCount() == 0:
