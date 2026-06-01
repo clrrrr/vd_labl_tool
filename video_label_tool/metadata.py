@@ -241,3 +241,90 @@ def write_annotation(video_path: Path, annotation: Annotation) -> None:
                 out_path.unlink()
         except OSError:
             pass
+
+
+# --- Save + rename ----------------------------------------------------------
+
+# Characters not allowed in filenames on Windows; we also strip ASCII null.
+_FILENAME_INVALID = set('<>:"/\\|?*\x00')
+
+
+def sanitize_for_filename(name: str) -> str:
+    """Strip / replace characters disallowed in filenames.
+
+    - Replaces Windows-reserved chars (``<>:"/\\|?*``) and ``NUL`` with ``_``
+    - Collapses internal whitespace runs to single spaces
+    - Trims leading/trailing dots and spaces (Windows rejects names ending
+      in either)
+    - Caps the result to 80 characters so the full path stays well under
+      Windows' legacy MAX_PATH
+    Returns an empty string if nothing usable survives.
+    """
+    if not name:
+        return ""
+    cleaned = "".join("_" if c in _FILENAME_INVALID else c for c in name)
+    cleaned = " ".join(cleaned.split())  # collapse whitespace
+    cleaned = cleaned.strip(" .")
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rstrip(" .")
+    return cleaned
+
+
+def compute_path_with_process_suffix(
+    current_path: Path,
+    factory_id: str,
+    process_name: str,
+) -> Path:
+    """Compute the desired filename for ``current_path`` given the process name.
+
+    Expected current stem: ``{factory_id}_{NNNNN}`` or
+    ``{factory_id}_{NNNNN}_{old_process_name}``. The function strips any old
+    process-name suffix and appends the sanitized new one. If the current
+    stem doesn't match this pattern (the rename pass left it alone for some
+    reason), the path is returned unchanged so we don't mangle it.
+    """
+    expected_prefix = f"{factory_id}_"
+    stem = current_path.stem
+    if not stem.startswith(expected_prefix):
+        return current_path
+    rest = stem[len(expected_prefix):]
+    if len(rest) < 5 or not rest[:5].isdigit():
+        return current_path
+    video_number = rest[:5]
+    sanitized = sanitize_for_filename(process_name)
+    new_stem = (
+        f"{factory_id}_{video_number}_{sanitized}"
+        if sanitized
+        else f"{factory_id}_{video_number}"
+    )
+    return current_path.with_name(f"{new_stem}{current_path.suffix}")
+
+
+def write_annotation_and_rename(
+    current_path: Path,
+    annotation: Annotation,
+    factory_id: str,
+) -> Path:
+    """Write the annotation then rename the file with a process-name suffix.
+
+    Always tries the rename after a successful metadata write. Returns the
+    new path on success, or the original path if the rename was a no-op or
+    had to be skipped to avoid clobbering an unrelated existing file.
+
+    If the target path already exists and is a different file, the rename is
+    silently skipped — the metadata was still saved, so the user's work isn't
+    lost; only the filename suffix is missing.
+    """
+    write_annotation(current_path, annotation)
+    target_path = compute_path_with_process_suffix(
+        current_path, factory_id, annotation.process_name,
+    )
+    if target_path == current_path:
+        return current_path
+    if target_path.exists():
+        return current_path  # avoid clobbering some other file
+    try:
+        os.replace(current_path, target_path)
+    except OSError:
+        return current_path
+    return target_path

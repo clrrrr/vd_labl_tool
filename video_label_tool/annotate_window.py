@@ -39,28 +39,51 @@ from PySide6.QtWidgets import (
 )
 
 from . import ui_strings as S
-from .metadata import Annotation, MetadataError, read_annotation, write_annotation
+from .metadata import (
+    Annotation,
+    MetadataError,
+    read_annotation,
+    write_annotation,
+    write_annotation_and_rename,
+)
 
 
 # --- Worker -----------------------------------------------------------------
 
 class _SaveWorker(QObject):
-    """Runs the metadata write on a worker thread."""
+    """Runs the metadata write on a worker thread.
 
-    finished = Signal(object)  # None on success, Exception on failure
+    The ``finished`` signal carries ``(error_or_none, final_path)`` so the
+    UI can refresh the file list with the file's new name when the save
+    also renames it (process-name suffix).
+    """
 
-    def __init__(self, video_path: Path, annotation: Annotation) -> None:
+    finished = Signal(object, object)  # (Exception | None, Path)
+
+    def __init__(
+        self,
+        video_path: Path,
+        annotation: Annotation,
+        factory_id: str | None,
+    ) -> None:
         super().__init__()
         self._video_path = video_path
         self._annotation = annotation
+        self._factory_id = factory_id
 
     def run(self) -> None:
         err: Exception | None = None
+        final_path = self._video_path
         try:
-            write_annotation(self._video_path, self._annotation)
+            if self._factory_id is not None:
+                final_path = write_annotation_and_rename(
+                    self._video_path, self._annotation, self._factory_id,
+                )
+            else:
+                write_annotation(self._video_path, self._annotation)
         except Exception as e:  # noqa: BLE001 — we report any failure to the UI
             err = e
-        self.finished.emit(err)
+        self.finished.emit(err, final_path)
 
 
 # --- Window -----------------------------------------------------------------
@@ -76,13 +99,16 @@ class AnnotateWindow(QDialog):
         parent: QWidget | None = None,
         *,
         prefilled_parts: list[str] | None = None,
+        factory_id: str | None = None,
     ) -> None:
         super().__init__(parent)
         self._video_path = video_path
+        self._factory_id = factory_id
         self._save_thread: QThread | None = None
         self._save_worker: _SaveWorker | None = None
         self._user_dragging = False
         self._prefilled_parts = list(prefilled_parts) if prefilled_parts else []
+        self._final_path: Path = video_path  # updated after save+rename succeeds
 
         self.setWindowTitle(S.ANNO_TITLE_TEMPLATE.format(filename=video_path.name))
         self.resize(1100, 650)
@@ -338,7 +364,7 @@ class AnnotateWindow(QDialog):
 
     def _start_save_worker(self, annotation: Annotation) -> None:
         thread = QThread(self)
-        worker = _SaveWorker(self._video_path, annotation)
+        worker = _SaveWorker(self._video_path, annotation, self._factory_id)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_save_finished)
@@ -350,10 +376,14 @@ class AnnotateWindow(QDialog):
         self._save_worker = worker
         thread.start()
 
-    def _on_save_finished(self, err: object) -> None:
+    def _on_save_finished(self, err: object, final_path: object) -> None:
         self._save_thread = None
         self._save_worker = None
         if err is None:
+            # Remember where the file ended up; caller reads this via final_path()
+            # to refresh the file list against the post-rename name.
+            if isinstance(final_path, Path):
+                self._final_path = final_path
             self.lbl_save_status.setText("")
             self.accept()
             return
@@ -364,6 +394,14 @@ class AnnotateWindow(QDialog):
         self._load_video()  # restore so user can keep viewing while they retry
         message = str(err) if err else "未知错误"
         QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, message)
+
+    def final_path(self) -> Path:
+        """The path the video has after exec() returns Accepted.
+
+        Same as the input ``video_path`` if no save happened, or if the save
+        wrote metadata but the rename was a no-op / had to be skipped.
+        """
+        return self._final_path
 
     def _release_player(self) -> None:
         self.player.stop()

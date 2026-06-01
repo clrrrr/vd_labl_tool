@@ -31,11 +31,20 @@ class MainWindow(QMainWindow):
         self._show_annotate(path, prefilled_parts=list(parts))
 
     def _show_annotate(self, path: Path, *, prefilled_parts: list | None) -> None:
-        dlg = AnnotateWindow(path, self, prefilled_parts=prefilled_parts)
+        dlg = AnnotateWindow(
+            path,
+            self,
+            prefilled_parts=prefilled_parts,
+            factory_id=self.file_list._factory_id,
+        )
         dlg.setWindowModality(Qt.ApplicationModal)
         dlg.exec()
-        # After save/cancel, re-read this file's status so the row updates.
-        self.file_list.rescan_path(path)
+        # The save flow may have renamed the file (appended _<process_name>),
+        # so re-list the whole folder rather than the original row.
+        if dlg.final_path() != path:
+            self.file_list.refresh_after_external_rename()
+        else:
+            self.file_list.rescan_path(path)
 
 
 def _check_dependencies(parent: QMainWindow | None = None) -> bool:

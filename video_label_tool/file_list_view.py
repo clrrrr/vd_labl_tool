@@ -41,7 +41,13 @@ from PySide6.QtWidgets import (
 
 from . import ui_strings as S
 from .export import ExportRow, export_to_xlsx
-from .metadata import Annotation, MetadataError, read_video_info, write_annotation
+from .metadata import (
+    Annotation,
+    MetadataError,
+    read_video_info,
+    write_annotation,
+    write_annotation_and_rename,
+)
 from .project_info_dialog import ProjectInfoDialog
 
 VIDEO_SUFFIXES = {".mp4", ".mov"}
@@ -225,26 +231,32 @@ class _ScanTask(QRunnable):
 class _PasteSaveWorker(QObject):
     """Writes an annotation in a worker thread (used by right-click paste).
 
-    The ``finished`` signal carries ``(video_path, exception_or_none)``. Each
-    worker owns its own signal so signal/slot connections are scoped to a
-    single paste-save lifecycle and auto-disconnect cleanly when the worker
-    is destroyed (no accumulating subscriptions on a shared QObject).
+    The ``finished`` signal carries ``(video_path, final_path, exception_or_none)``.
+    ``video_path`` is the path the user pasted onto; ``final_path`` is the
+    same path or its renamed version after the process-name suffix is
+    appended. Each worker owns its own signal so signal/slot connections
+    are scoped to a single paste-save lifecycle and auto-disconnect cleanly
+    when the worker is destroyed.
     """
 
-    finished = Signal(object, object)  # (video_path, exception_or_none)
+    finished = Signal(object, object, object)  # (video_path, final_path, exception_or_none)
 
-    def __init__(self, video_path: Path, annotation: Annotation):
+    def __init__(self, video_path: Path, annotation: Annotation, factory_id: str):
         super().__init__()
         self._video_path = video_path
         self._annotation = annotation
+        self._factory_id = factory_id
 
     def run(self) -> None:
         err: Exception | None = None
+        final_path = self._video_path
         try:
-            write_annotation(self._video_path, self._annotation)
+            final_path = write_annotation_and_rename(
+                self._video_path, self._annotation, self._factory_id,
+            )
         except Exception as e:  # noqa: BLE001 — surfaced to the UI
             err = e
-        self.finished.emit(self._video_path, err)
+        self.finished.emit(self._video_path, final_path, err)
 
 
 # --- Model ------------------------------------------------------------------
@@ -469,6 +481,15 @@ class FileListView(QWidget):
         self.model.update_row_status(row, S.STATUS_SCANNING, None)
         self._refresh_counts_label()
         self._pool.start(_ScanTask(self._generation, row, path, self._scan_signals))
+
+    def refresh_after_external_rename(self) -> None:
+        """Re-list the current folder when a file's path has changed.
+
+        Used by save flows that rename the underlying file (process-name
+        suffix). Does NOT re-run the factory-id rename pass — just scans.
+        """
+        if self._folder is not None:
+            self._rescan_folder()
 
     # --- Slots --------------------------------------------------------------
 
@@ -722,7 +743,7 @@ class FileListView(QWidget):
             self._refresh_counts_label()
 
         thread = QThread(self)
-        worker = _PasteSaveWorker(row.path, new_anno)
+        worker = _PasteSaveWorker(row.path, new_anno, self._factory_id)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_paste_save_finished)
@@ -732,15 +753,20 @@ class FileListView(QWidget):
         self._active_saves[row.path] = (thread, worker)
         thread.start()
 
-    def _on_paste_save_finished(self, video_path: Path, err: object) -> None:
+    def _on_paste_save_finished(
+        self, video_path: Path, final_path: Path, err: object,
+    ) -> None:
         self._active_saves.pop(video_path, None)
         if err is not None:
             QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, str(err))
-        # Re-read the file so the row reflects the new state (or the old one
-        # if the save failed).
-        self.rescan_path(video_path)
+        # If the file was also renamed (process-name suffix), the row's path
+        # in the model is now stale — refresh the whole folder.
+        if final_path != video_path:
+            self.refresh_after_external_rename()
+        else:
+            self.rescan_path(video_path)
         if err is None:
-            self._flash_status(S.TOAST_PARTS_PASTED.format(filename=video_path.name))
+            self._flash_status(S.TOAST_PARTS_PASTED.format(filename=final_path.name))
 
     def _flash_status(self, message: str, ms: int = 2500) -> None:
         """Temporarily overlay a message on the counts label."""
