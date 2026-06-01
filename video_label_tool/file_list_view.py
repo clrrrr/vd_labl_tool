@@ -382,8 +382,6 @@ class FileListView(QWidget):
         self.btn_project_info.clicked.connect(self._on_project_info)
         self.btn_open = QPushButton(S.BTN_OPEN_FOLDER)
         self.btn_open.clicked.connect(self._on_open_folder)
-        self.btn_open.setEnabled(False)
-        self.btn_open.setToolTip(S.BTN_OPEN_FOLDER_DISABLED_TOOLTIP)
         self.btn_refresh = QPushButton(S.BTN_REFRESH)
         self.btn_refresh.clicked.connect(self._on_refresh)
         self.btn_refresh.setEnabled(False)
@@ -437,14 +435,20 @@ class FileListView(QWidget):
 
     # --- Slots --------------------------------------------------------------
 
-    def _on_project_info(self) -> None:
+    def _prompt_project_info(self) -> bool:
+        """Show the project info dialog. Returns True if the user accepted.
+
+        Side effects on accept: updates ``_factory_id`` / ``_factory_name``,
+        refreshes the button label, and if the factory id actually changed
+        while a folder is already loaded, triggers a re-rename + rescan.
+        """
         dlg = ProjectInfoDialog(
             self,
             initial_factory_id=self._factory_id or "",
             initial_factory_name=self._factory_name or "",
         )
         if dlg.exec() != dlg.Accepted:
-            return
+            return False
         new_id, new_name = dlg.values()
         id_changed = new_id != self._factory_id
         self._factory_id = new_id
@@ -454,18 +458,19 @@ class FileListView(QWidget):
                 factory_id=new_id, factory_name=new_name,
             )
         )
-        self.btn_open.setEnabled(True)
-        self.btn_open.setToolTip("")
-        # If the factory id changed and a folder is already loaded, re-rename
-        # so existing files line up with the new id before the next scan.
         if id_changed and self._folder is not None:
             self._prepare_and_scan_folder()
+        return True
+
+    def _on_project_info(self) -> None:
+        self._prompt_project_info()
 
     def _on_open_folder(self) -> None:
+        # Both buttons are clickable in any order — if the user hasn't filled
+        # project info yet, prompt for it now and chain into folder selection.
         if self._factory_id is None:
-            # Shouldn't normally happen — button is disabled — but defend.
-            self._on_project_info()
-            return
+            if not self._prompt_project_info():
+                return
         start_dir = str(self._folder) if self._folder else str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, S.BTN_OPEN_FOLDER, start_dir)
         if not chosen:
