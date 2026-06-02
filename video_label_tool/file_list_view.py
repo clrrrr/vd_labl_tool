@@ -99,16 +99,18 @@ def _fmt_duration(seconds: float | None) -> str:
 
 
 def _extract_video_number(stem: str) -> str:
-    """Pull the trailing ``NNNNN`` out of a renamed filename stem.
+    """Pull the ``{factory_id}_{NNNNN}`` prefix from a renamed filename stem.
 
-    Inputs like ``FAC123_00005`` → ``"00005"``. If the stem doesn't follow
-    the rename pattern (rare; only possible if the rename pass left
-    something behind), fall back to the whole stem so the row still has
-    *something* identifying it.
+    Inputs like ``FAB7_00002`` → ``"FAB7_00002"``, and
+    ``FAB7_00002_安装反光碗`` → ``"FAB7_00002"`` (the trailing process-name
+    suffix is dropped). If the stem doesn't match the rename pattern at
+    all, falls back to the whole stem so the row still has *something*
+    identifying it.
     """
-    parts = stem.rsplit("_", 1)
-    if len(parts) == 2 and parts[1].isdigit():
-        return parts[1]
+    import re
+    m = re.match(r"^(.*?_\d{5})(_.*)?$", stem)
+    if m:
+        return m.group(1)
     return stem
 
 
