@@ -35,7 +35,6 @@ class MainWindow(QMainWindow):
             path,
             self,
             prefilled_parts=prefilled_parts,
-            factory_id=self.file_list._factory_id,
         )
         dlg.setWindowModality(Qt.ApplicationModal)
         dlg.exec()

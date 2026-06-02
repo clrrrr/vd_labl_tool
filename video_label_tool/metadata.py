@@ -248,6 +248,26 @@ def write_annotation(video_path: Path, annotation: Annotation) -> None:
 # Characters not allowed in filenames on Windows; we also strip ASCII null.
 _FILENAME_INVALID = set('<>:"/\\|?*\x00')
 
+# Filename pattern produced by the rename pass / save flow:
+# ``{factory_id}_{NNNNN}[_{process_name}].{ext}``. NNNNN is exactly 5 digits.
+# factory_id is non-greedy so the first 5-digit run wins (handles factory_ids
+# that themselves contain underscores).
+import re as _re
+_FILENAME_PATTERN = _re.compile(r"^(.*?)_(\d{5})(?:_(.*))?$")
+
+
+def parse_filename_pattern(stem: str) -> tuple[str, str, str] | None:
+    """Parse ``{factory_id}_{NNNNN}[_{process_name}]`` from a stem.
+
+    Returns ``(factory_id, video_number, process_name)`` or ``None`` if the
+    stem doesn't match the rename pattern. ``process_name`` is the empty
+    string when there's no trailing suffix.
+    """
+    m = _FILENAME_PATTERN.match(stem)
+    if not m:
+        return None
+    return m.group(1), m.group(2), (m.group(3) or "")
+
 
 def sanitize_for_filename(name: str) -> str:
     """Strip / replace characters disallowed in filenames.

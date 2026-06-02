@@ -42,6 +42,7 @@ from . import ui_strings as S
 from .metadata import (
     Annotation,
     MetadataError,
+    parse_filename_pattern,
     read_annotation,
     write_annotation,
     write_annotation_and_rename,
@@ -55,32 +56,29 @@ class _SaveWorker(QObject):
 
     The ``finished`` signal carries ``(error_or_none, final_path)`` so the
     UI can refresh the file list with the file's new name when the save
-    also renames it (process-name suffix).
+    also renames it (process-name suffix). v0.5 parses the factory_id out
+    of the input filename — there's no project-info state to consult.
     """
 
     finished = Signal(object, object)  # (Exception | None, Path)
 
-    def __init__(
-        self,
-        video_path: Path,
-        annotation: Annotation,
-        factory_id: str | None,
-    ) -> None:
+    def __init__(self, video_path: Path, annotation: Annotation) -> None:
         super().__init__()
         self._video_path = video_path
         self._annotation = annotation
-        self._factory_id = factory_id
 
     def run(self) -> None:
         err: Exception | None = None
         final_path = self._video_path
         try:
-            if self._factory_id is not None:
-                final_path = write_annotation_and_rename(
-                    self._video_path, self._annotation, self._factory_id,
-                )
-            else:
+            parsed = parse_filename_pattern(self._video_path.stem)
+            if parsed is None:
                 write_annotation(self._video_path, self._annotation)
+            else:
+                factory_id, _, _ = parsed
+                final_path = write_annotation_and_rename(
+                    self._video_path, self._annotation, factory_id,
+                )
         except Exception as e:  # noqa: BLE001 — we report any failure to the UI
             err = e
         self.finished.emit(err, final_path)
@@ -99,11 +97,9 @@ class AnnotateWindow(QDialog):
         parent: QWidget | None = None,
         *,
         prefilled_parts: list[str] | None = None,
-        factory_id: str | None = None,
     ) -> None:
         super().__init__(parent)
         self._video_path = video_path
-        self._factory_id = factory_id
         self._save_thread: QThread | None = None
         self._save_worker: _SaveWorker | None = None
         self._user_dragging = False
@@ -248,19 +244,38 @@ class AnnotateWindow(QDialog):
     # --- Loading state ------------------------------------------------------
 
     def _load_existing_annotation(self) -> None:
+        """Populate form fields.
+
+        v0.5 default:
+        - 工序名: derived from the filename suffix ({factory_id}_{NNNNN}_{suffix})
+          if present. If JSON already has a process_name and the filename
+          doesn't, fall back to the JSON value (rare).
+        - 物品列表: from the JSON annotation if present, otherwise the
+          ``prefilled_parts`` the caller may have supplied (right-click paste
+          flow onto an un-annotated video).
+        """
         try:
             existing = read_annotation(self._video_path)
         except MetadataError:
             existing = None
-        if existing is not None:
+
+        # Process name: filename-derived first, JSON fallback only if filename
+        # has no suffix to read.
+        parsed = parse_filename_pattern(self._video_path.stem)
+        process_from_name = parsed[2] if parsed else ""
+        if process_from_name:
+            self.edt_process.setText(process_from_name)
+        elif existing is not None and existing.process_name:
             self.edt_process.setText(existing.process_name)
+
+        # Parts list: JSON wins; prefilled is the fallback for un-annotated
+        # videos.
+        if existing is not None:
             for p in existing.parts_involved:
                 self.lst_parts.addItem(QListWidgetItem(p))
-            return
-        # No annotation on disk — if the caller supplied a prefilled parts
-        # list (right-click paste onto an un-annotated video), use it.
-        for p in self._prefilled_parts:
-            self.lst_parts.addItem(QListWidgetItem(p))
+        else:
+            for p in self._prefilled_parts:
+                self.lst_parts.addItem(QListWidgetItem(p))
 
     def _load_video(self) -> None:
         self.player.setSource(QUrl.fromLocalFile(str(self._video_path)))
@@ -364,7 +379,7 @@ class AnnotateWindow(QDialog):
 
     def _start_save_worker(self, annotation: Annotation) -> None:
         thread = QThread(self)
-        worker = _SaveWorker(self._video_path, annotation, self._factory_id)
+        worker = _SaveWorker(self._video_path, annotation)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_save_finished)
