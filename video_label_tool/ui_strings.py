@@ -22,6 +22,8 @@ DLG_PROJECT_INFO_VALIDATE_NAME = "工厂名不能为空"
 # Rename
 RENAME_WARNING_TITLE = "部分文件重命名失败"
 RENAME_WARNING_TEMPLATE = "以下文件无法重命名(已跳过):\n{lines}"
+FOLDER_RENAME_FAIL_TITLE = "文件夹重命名失败"
+FOLDER_RENAME_FAIL_TEMPLATE = "无法将文件夹改名为 {target}:\n{reason}\n\n标注流程仍可继续,只是文件夹名维持原样。"
 
 # Export
 DLG_EXPORT_NOTHING_TITLE = "没有可导出内容"

@@ -45,6 +45,7 @@ from .metadata import (
     Annotation,
     MetadataError,
     read_video_info,
+    sanitize_for_filename,
     write_annotation,
     write_annotation_and_rename,
 )
@@ -171,7 +172,7 @@ def rename_videos_to_factory_pattern(
         return ""
 
     targets = [
-        folder / f"{factory_id}_{i:05d}{_existing_suffix(p.stem)}{p.suffix}"
+        folder / f"{factory_id}_{i + 1:05d}{_existing_suffix(p.stem)}{p.suffix}"
         for i, p in enumerate(videos)
     ]
     if all(p == t for p, t in zip(videos, targets)):
@@ -207,6 +208,34 @@ def rename_videos_to_factory_pattern(
             # the user can recover it from disk.
 
     return final, errors
+
+
+def rename_folder_to_project_pattern(
+    folder: Path,
+    factory_id: str,
+    factory_name: str,
+) -> tuple[Path, str | None]:
+    """Rename ``folder`` itself to ``{factory_id}_{factory_name}``.
+
+    Returns ``(folder_path_after, error_or_none)``. On success, the returned
+    path is the new folder location. On failure (target exists, OS error,
+    permission denied, file lock on a parent process), the returned path is
+    the original ``folder`` and the error message is non-None. Idempotent —
+    when the folder already has the right name, returns the original path
+    with no error and without touching the filesystem.
+    """
+    sanitized_name = sanitize_for_filename(factory_name)
+    target_name = f"{factory_id}_{sanitized_name}" if sanitized_name else factory_id
+    if folder.name == target_name:
+        return folder, None
+    new_path = folder.parent / target_name
+    if new_path.exists():
+        return folder, f"目标文件夹已存在: {new_path.name}"
+    try:
+        os.rename(folder, new_path)
+    except OSError as e:
+        return folder, str(e)
+    return new_path, None
 
 
 # --- Worker -----------------------------------------------------------------
@@ -517,7 +546,7 @@ class FileListView(QWidget):
         if dlg.exec() != QDialog.Accepted:
             return False
         new_id, new_name = dlg.values()
-        id_changed = new_id != self._factory_id
+        info_changed = (new_id != self._factory_id) or (new_name != self._factory_name)
         self._factory_id = new_id
         self._factory_name = new_name
         self.btn_project_info.setText(
@@ -525,7 +554,9 @@ class FileListView(QWidget):
                 factory_id=new_id, factory_name=new_name,
             )
         )
-        if id_changed and self._folder is not None:
+        # The folder name embeds both factory_id and factory_name now, so a
+        # change in either should trigger a re-rename + rescan.
+        if info_changed and self._folder is not None:
             self._prepare_and_scan_folder()
         return True
 
@@ -596,9 +627,28 @@ class FileListView(QWidget):
         )
 
     def _prepare_and_scan_folder(self) -> None:
-        """Rename videos to the factory pattern, then trigger an async scan."""
+        """Rename the folder + videos to the project pattern, then scan."""
         assert self._folder is not None
         assert self._factory_id is not None
+
+        # 1. Rename the folder itself to {factory_id}_{factory_name}.
+        new_folder, folder_err = rename_folder_to_project_pattern(
+            self._folder, self._factory_id, self._factory_name or "",
+        )
+        if folder_err is not None:
+            QMessageBox.warning(
+                self,
+                S.FOLDER_RENAME_FAIL_TITLE,
+                S.FOLDER_RENAME_FAIL_TEMPLATE.format(
+                    target=f"{self._factory_id}_{self._factory_name or ''}",
+                    reason=folder_err,
+                ),
+            )
+        if new_folder != self._folder:
+            self._folder = new_folder
+            self.lbl_folder.setText(S.LABEL_FOLDER_PREFIX + str(self._folder))
+
+        # 2. Rename the videos inside.
         _, errors = rename_videos_to_factory_pattern(self._folder, self._factory_id)
         if errors:
             lines = "\n".join(f"  · {p.name}: {msg}" for p, msg in errors)
@@ -607,6 +657,8 @@ class FileListView(QWidget):
                 S.RENAME_WARNING_TITLE,
                 S.RENAME_WARNING_TEMPLATE.format(lines=lines),
             )
+
+        # 3. List the (now-renamed) folder.
         self._rescan_folder()
 
     def _rescan_folder(self) -> None:
