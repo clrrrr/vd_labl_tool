@@ -50,9 +50,15 @@ def export_to_xlsx(rows: list[ExportRow], output_path: Path) -> None:
     ws.column_dimensions["C"].width = 16
 
     # Right-align the duration column, center the video number column.
+    # Force the video-number column to text format ("@"). Excel / WPS see
+    # an unformatted cell with a value like "00002" and "helpfully" coerce
+    # it to a number, dropping the leading zeros → "2". The text format
+    # tells them to display the string verbatim.
     right = Alignment(horizontal="right")
     for row in range(2, ws.max_row + 1):
-        ws.cell(row=row, column=1).alignment = center
+        cell_a = ws.cell(row=row, column=1)
+        cell_a.alignment = center
+        cell_a.number_format = "@"
         ws.cell(row=row, column=3).alignment = right
 
     ws.freeze_panes = "A2"
