@@ -16,6 +16,14 @@ DLG_EXPORT_OK_TITLE = "导出成功"
 DLG_EXPORT_OK_TEMPLATE = "已导出 {count} 行到:\n{path}"
 DLG_EXPORT_FAIL_TITLE = "导出失败"
 
+# Background save status
+SAVING_BANNER_TEMPLATE = "⚠ 保存中,共 {n} 个,请勿退出及拔出硬盘！！"
+DLG_CLOSE_DURING_SAVE_TITLE = "还有保存任务在进行"
+DLG_CLOSE_DURING_SAVE_MSG = (
+    "还有 {n} 个文件正在后台保存中。\n"
+    "请等所有保存完成(顶部警告条消失)后再关闭程序。"
+)
+
 # File list columns
 COL_FILENAME = "文件名"
 COL_STATUS = "状态"

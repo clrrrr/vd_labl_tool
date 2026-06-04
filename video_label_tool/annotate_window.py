@@ -1,9 +1,11 @@
-"""Annotate window — video player + Process Name / Parts Involved form.
+"""Annotate window — video player + 工序名 / 物品列表 form.
 
-Layout: horizontal splitter with a video player on the left and the annotation
-form on the right. Saving runs in a background QThread so the UI never blocks
-on ffmpeg, and the file handle held by QMediaPlayer is released before ffmpeg
-rewrites the file (required on Windows where the rename would otherwise fail).
+Layout: horizontal splitter with a video player on the left and the
+annotation form on the right. The Save button does NOT block — clicking it
+emits ``save_requested`` and immediately closes the dialog. The actual
+file write (which can take 10+ seconds on slow disks / network drives)
+runs in the FileListView's background save pool, with a persistent
+warning banner visible while it's in flight.
 """
 
 from __future__ import annotations
@@ -11,9 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QObject,
     Qt,
-    QThread,
     QTimer,
     QUrl,
     Signal,
@@ -22,6 +22,7 @@ from PySide6.QtGui import QKeyEvent
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QHBoxLayout,
@@ -44,52 +45,22 @@ from .metadata import (
     MetadataError,
     parse_filename_pattern,
     read_annotation,
-    write_annotation,
-    write_annotation_and_rename,
 )
-
-
-# --- Worker -----------------------------------------------------------------
-
-class _SaveWorker(QObject):
-    """Runs the metadata write on a worker thread.
-
-    The ``finished`` signal carries ``(error_or_none, final_path)`` so the
-    UI can refresh the file list with the file's new name when the save
-    also renames it (process-name suffix). v0.5 parses the factory_id out
-    of the input filename — there's no project-info state to consult.
-    """
-
-    finished = Signal(object, object)  # (Exception | None, Path)
-
-    def __init__(self, video_path: Path, annotation: Annotation) -> None:
-        super().__init__()
-        self._video_path = video_path
-        self._annotation = annotation
-
-    def run(self) -> None:
-        err: Exception | None = None
-        final_path = self._video_path
-        try:
-            parsed = parse_filename_pattern(self._video_path.stem)
-            if parsed is None:
-                write_annotation(self._video_path, self._annotation)
-            else:
-                factory_id, _, _ = parsed
-                final_path = write_annotation_and_rename(
-                    self._video_path, self._annotation, factory_id,
-                )
-        except Exception as e:  # noqa: BLE001 — we report any failure to the UI
-            err = e
-        self.finished.emit(err, final_path)
 
 
 # --- Window -----------------------------------------------------------------
 
 class AnnotateWindow(QDialog):
-    """Modal annotation editor for one video."""
+    """Modal annotation editor for one video.
+
+    Doesn't write the file itself — emits ``save_requested(path, annotation)``
+    so the file list view can run the actual ffmpeg call on a background
+    thread. The dialog closes immediately on save so the user can move on.
+    """
 
     SPEED_OPTIONS = [("0.5x", 0.5), ("1.0x", 1.0), ("1.5x", 1.5), ("2.0x", 2.0)]
+
+    save_requested = Signal(Path, object)  # path, Annotation
 
     def __init__(
         self,
@@ -100,19 +71,14 @@ class AnnotateWindow(QDialog):
     ) -> None:
         super().__init__(parent)
         self._video_path = video_path
-        self._save_thread: QThread | None = None
-        self._save_worker: _SaveWorker | None = None
         self._user_dragging = False
         self._prefilled_parts = list(prefilled_parts) if prefilled_parts else []
-        self._final_path: Path = video_path  # updated after save+rename succeeds
 
         self.setWindowTitle(S.ANNO_TITLE_TEMPLATE.format(filename=video_path.name))
         self.resize(1100, 650)
 
         self._build_ui()
         self._load_existing_annotation()
-        # Defer setting source until after the window is shown so the video
-        # widget has a valid native handle on every platform.
         QTimer.singleShot(0, self._load_video)
 
     # --- UI construction ----------------------------------------------------
@@ -131,9 +97,7 @@ class AnnotateWindow(QDialog):
         root.addWidget(splitter, 1)
 
         bottom = QHBoxLayout()
-        self.lbl_save_status = QLabel("")
-        self.lbl_save_status.setStyleSheet("color: #555;")
-        bottom.addWidget(self.lbl_save_status, 1)
+        bottom.addStretch(1)
         self.btn_cancel = QPushButton(S.ANNO_BTN_CANCEL)
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_save = QPushButton(S.ANNO_BTN_SAVE)
@@ -369,82 +333,22 @@ class AnnotateWindow(QDialog):
         #    rename over the input on Windows.
         self._release_player()
 
-        # 3. Disable UI and kick off the worker.
-        self._set_busy(True)
-        self.lbl_save_status.setText("保存中…")
-
-        # Brief delay lets MF finish releasing the file handle asynchronously
-        # on Windows. Harmless on macOS/Linux.
-        QTimer.singleShot(120, lambda: self._start_save_worker(annotation))
-
-    def _start_save_worker(self, annotation: Annotation) -> None:
-        thread = QThread(self)
-        worker = _SaveWorker(self._video_path, annotation)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_save_finished)
-        # Tear-down chain: worker.finished → thread.quit → thread.finished → cleanup
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._save_thread = thread
-        self._save_worker = worker
-        thread.start()
-
-    def _on_save_finished(self, err: object, final_path: object) -> None:
-        self._save_thread = None
-        self._save_worker = None
-        if err is None:
-            # Remember where the file ended up; caller reads this via final_path()
-            # to refresh the file list against the post-rename name.
-            if isinstance(final_path, Path):
-                self._final_path = final_path
-            self.lbl_save_status.setText("")
-            self.accept()
-            return
-
-        # Failure: re-enable form, optionally re-load video, show error.
-        self.lbl_save_status.setText("")
-        self._set_busy(False)
-        self._load_video()  # restore so user can keep viewing while they retry
-        message = str(err) if err else "未知错误"
-        QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, message)
-
-    def final_path(self) -> Path:
-        """The path the video has after exec() returns Accepted.
-
-        Same as the input ``video_path`` if no save happened, or if the save
-        wrote metadata but the rename was a no-op / had to be skipped.
-        """
-        return self._final_path
+        # 3. Hand the annotation off to the background save queue and close
+        #    the dialog. The actual file write happens elsewhere — if it
+        #    fails, the file list view surfaces the error.
+        self.save_requested.emit(self._video_path, annotation)
+        self.accept()
 
     def _release_player(self) -> None:
         self.player.stop()
         self.player.setSource(QUrl())
         # Let Qt and the underlying media backend process the source change.
-        from PySide6.QtWidgets import QApplication
         QApplication.processEvents()
-
-    def _set_busy(self, busy: bool) -> None:
-        for w in (
-            self.btn_save, self.btn_cancel, self.btn_play, self.btn_add,
-            self.btn_remove, self.cmb_speed, self.edt_process, self.edt_part,
-            self.lst_parts, self.slider, self.slider_vol,
-        ):
-            w.setEnabled(not busy)
 
     # --- Window lifecycle ---------------------------------------------------
 
     def closeEvent(self, event):  # noqa: N802 — Qt API
-        # If a save is in progress, refuse to close. Otherwise the worker
-        # would emit finished into a dialog the user thinks is gone (a stray
-        # error message could pop up later, and accept() on a hidden dialog
-        # is confusing). The form is already disabled via _set_busy, so the
-        # user is just waiting a few seconds at most.
-        if self._save_thread is not None and self._save_thread.isRunning():
-            event.ignore()
-            return
-        # Ensure player releases the file when the window closes (any path).
+        # Save is async + decoupled, so closing is always safe.
         self.player.stop()
         self.player.setSource(QUrl())
         super().closeEvent(event)

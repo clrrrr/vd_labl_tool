@@ -162,17 +162,16 @@ class _ScanTask(QRunnable):
         self._signals.done.emit(self._gen, self._row, annotation, duration, err)
 
 
-class _PasteSaveWorker(QObject):
-    """Writes an annotation in a worker thread (used by right-click paste).
+class _BackgroundSaveWorker(QObject):
+    """Writes an annotation in a worker thread.
 
-    The ``finished`` signal carries ``(video_path, final_path, exception_or_none)``.
-    ``video_path`` is the path the user pasted onto; ``final_path`` is the
-    same path or its renamed version after the process-name suffix is
-    re-applied. Each worker owns its own signal so signal/slot connections
-    are scoped to a single paste-save lifecycle.
+    Used by both the AnnotateWindow save flow (after the dialog closes) and
+    the right-click paste flow. The ``finished`` signal carries
+    ``(video_path, final_path, exception_or_none)``. Each worker owns its
+    own signal so signal/slot connections are scoped to a single save's
+    lifecycle.
 
-    v0.5: factory_id is parsed from the filename itself rather than supplied
-    by the caller (there's no project-info state to lean on).
+    factory_id is parsed from the filename itself (no project-info state).
     """
 
     finished = Signal(object, object, object)  # (video_path, final_path, exception_or_none)
@@ -188,8 +187,6 @@ class _PasteSaveWorker(QObject):
         try:
             parsed = parse_filename_pattern(self._video_path.stem)
             if parsed is None:
-                # Filename doesn't match the rename pattern — write metadata
-                # but don't try to rename.
                 write_annotation(self._video_path, self._annotation)
             else:
                 factory_id, _, _ = parsed
@@ -348,9 +345,10 @@ class FileListView(QWidget):
         # Just app-internal — does not touch the OS clipboard.
         self._parts_clipboard: list[str] | None = None
 
-        # Track active paste-save workers so they aren't garbage collected
-        # mid-flight. Keyed by file path.
-        self._active_saves: dict[Path, tuple[QThread, _PasteSaveWorker]] = {}
+        # Track active save workers so they aren't garbage collected
+        # mid-flight. Keyed by file path. Drives the persistent "保存中"
+        # warning banner and the main-window close guard.
+        self._active_saves: dict[Path, tuple[QThread, _BackgroundSaveWorker]] = {}
 
         self.model = VideoTableModel(self)
 
@@ -378,6 +376,16 @@ class FileListView(QWidget):
         self.lbl_counts = QLabel("")
         self.lbl_counts.setStyleSheet("color: #555; padding: 2px 0;")
         root.addWidget(self.lbl_counts)
+
+        # Persistent warning banner shown while any background save is
+        # running. Hidden when there are no active saves.
+        self.lbl_saving = QLabel("")
+        self.lbl_saving.setStyleSheet(
+            "color: #b00020; font-weight: bold; padding: 4px 6px; "
+            "background-color: #fff4f4; border: 1px solid #f5c2c7; border-radius: 4px;"
+        )
+        self.lbl_saving.setVisible(False)
+        root.addWidget(self.lbl_saving)
 
         self.table = QTableView()
         self.table.setModel(self.model)
@@ -421,6 +429,52 @@ class FileListView(QWidget):
         """
         if self._folder is not None:
             self._rescan_folder()
+
+    def has_active_saves(self) -> bool:
+        """True while at least one background save is still running."""
+        return bool(self._active_saves)
+
+    def is_saving(self, path: Path) -> bool:
+        """True if a background save is currently in flight for ``path``."""
+        return path in self._active_saves
+
+    def request_save(self, path: Path, annotation: Annotation) -> None:
+        """Spawn a background save worker for ``annotation`` on ``path``.
+
+        Idempotent against the same path — if a save is already running for
+        it, the request is ignored (we can't have two writers racing on the
+        same file). When the save finishes, the model row is refreshed
+        automatically (the file path may have changed if the process-name
+        suffix was rewritten).
+        """
+        if path in self._active_saves:
+            return
+
+        row_idx = self.model.find_row_by_path(path)
+        if row_idx >= 0:
+            current = self.model._rows[row_idx]
+            self.model.update_row_status(row_idx, S.STATUS_SAVING, current.annotation)
+            self._refresh_counts_label()
+
+        thread = QThread(self)
+        worker = _BackgroundSaveWorker(path, annotation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_save_finished)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._active_saves[path] = (thread, worker)
+        self._update_saving_banner()
+        thread.start()
+
+    def _update_saving_banner(self) -> None:
+        n = len(self._active_saves)
+        if n == 0:
+            self.lbl_saving.setVisible(False)
+        else:
+            self.lbl_saving.setText(S.SAVING_BANNER_TEMPLATE.format(n=n))
+            self.lbl_saving.setVisible(True)
 
     # --- Slots --------------------------------------------------------------
 
@@ -538,6 +592,8 @@ class FileListView(QWidget):
             return
         if row.status == S.STATUS_SCANNING:
             return  # avoid opening while we're still figuring out current state
+        if row.path in self._active_saves:
+            return  # save in flight — file may be renamed any moment
         self.video_double_clicked.emit(row.path)
 
     def _refresh_counts_label(self) -> None:
@@ -602,35 +658,21 @@ class FileListView(QWidget):
             self.paste_to_unannotated.emit(row.path, parts)
             return
 
-        # Annotated target: keep its Process Name, replace parts, save in the
-        # background. We don't need a file-lock dance here because nothing in
-        # the file list view holds an open handle on the file.
-        if row.path in self._active_saves:
-            return  # already saving this file
-        new_anno = Annotation(
-            process_name=row.annotation.process_name,
-            parts_involved=parts,
+        # Annotated target: keep its Process Name, replace parts, queue a
+        # background save through the same path AnnotateWindow uses.
+        self.request_save(
+            row.path,
+            Annotation(
+                process_name=row.annotation.process_name,
+                parts_involved=parts,
+            ),
         )
-        row_idx = self.model.find_row_by_path(row.path)
-        if row_idx >= 0:
-            self.model.update_row_status(row_idx, S.STATUS_SAVING, row.annotation)
-            self._refresh_counts_label()
 
-        thread = QThread(self)
-        worker = _PasteSaveWorker(row.path, new_anno)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_paste_save_finished)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._active_saves[row.path] = (thread, worker)
-        thread.start()
-
-    def _on_paste_save_finished(
+    def _on_save_finished(
         self, video_path: Path, final_path: Path, err: object,
     ) -> None:
         self._active_saves.pop(video_path, None)
+        self._update_saving_banner()
         if err is not None:
             QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, str(err))
         # If the file was also renamed (process-name suffix), the row's path
