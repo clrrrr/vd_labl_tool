@@ -61,6 +61,7 @@ class AnnotateWindow(QDialog):
     SPEED_OPTIONS = [("0.5x", 0.5), ("1.0x", 1.0), ("1.5x", 1.5), ("2.0x", 2.0)]
 
     save_requested = Signal(Path, object)  # path, Annotation
+    save_and_next_requested = Signal(Path, object)  # path, Annotation
 
     def __init__(
         self,
@@ -73,6 +74,7 @@ class AnnotateWindow(QDialog):
         self._video_path = video_path
         self._user_dragging = False
         self._prefilled_parts = list(prefilled_parts) if prefilled_parts else []
+        self._seek_step_ms = 5000  # 默认跳跃5秒
 
         self.setWindowTitle(S.ANNO_TITLE_TEMPLATE.format(filename=video_path.name))
         self.resize(1100, 650)
@@ -101,10 +103,12 @@ class AnnotateWindow(QDialog):
         self.btn_cancel = QPushButton(S.ANNO_BTN_CANCEL)
         self.btn_cancel.clicked.connect(self.reject)
         self.btn_save = QPushButton(S.ANNO_BTN_SAVE)
-        self.btn_save.setDefault(True)
         self.btn_save.clicked.connect(self._on_save_clicked)
+        self.btn_next = QPushButton("下一个(保存当前)")
+        self.btn_next.clicked.connect(self._on_save_and_next_clicked)
         bottom.addWidget(self.btn_cancel)
         bottom.addWidget(self.btn_save)
+        bottom.addWidget(self.btn_next)
         root.addLayout(bottom)
 
     def _build_player_pane(self) -> QWidget:
@@ -158,6 +162,16 @@ class AnnotateWindow(QDialog):
         self.slider_vol.valueChanged.connect(self._on_volume_changed)
         ctrls.addWidget(self.slider_vol)
 
+        ctrls.addSpacing(12)
+        ctrls.addWidget(QLabel("跳跃:"))
+        self.cmb_seek_step = QComboBox()
+        self.cmb_seek_step.addItem("3秒", 3000)
+        self.cmb_seek_step.addItem("5秒", 5000)
+        self.cmb_seek_step.addItem("10秒", 10000)
+        self.cmb_seek_step.setCurrentIndex(1)  # 默认5秒
+        self.cmb_seek_step.currentIndexChanged.connect(self._on_seek_step_changed)
+        ctrls.addWidget(self.cmb_seek_step)
+
         ctrls.addStretch(1)
         v.addLayout(ctrls)
 
@@ -181,6 +195,7 @@ class AnnotateWindow(QDialog):
         v.addWidget(QLabel(S.ANNO_LABEL_PROCESS))
         self.edt_process = QLineEdit()
         self.edt_process.setMaxLength(500)
+        self.edt_process.returnPressed.connect(lambda: self.edt_part.setFocus())
         v.addWidget(self.edt_process)
 
         v.addSpacing(8)
@@ -223,10 +238,11 @@ class AnnotateWindow(QDialog):
         except MetadataError:
             existing = None
 
-        # Process name: filename-derived first, JSON fallback only if filename
-        # has no suffix to read.
-        parsed = parse_filename_pattern(self._video_path.stem)
-        process_from_name = parsed[2] if parsed else ""
+        # Process name: extract text after the last underscore in filename.
+        # Examples: "00001_安装镜头" -> "安装镜头", "factory_00001_安装镜头" -> "安装镜头"
+        # If no underscore, leave empty; JSON fallback if no filename suffix.
+        stem = self._video_path.stem
+        process_from_name = stem.rsplit('_', 1)[-1] if '_' in stem else ""
         if process_from_name:
             self.edt_process.setText(process_from_name)
         elif existing is not None and existing.process_name:
@@ -263,6 +279,9 @@ class AnnotateWindow(QDialog):
 
     def _on_volume_changed(self, value: int) -> None:
         self.audio.setVolume(value / 100.0)
+
+    def _on_seek_step_changed(self, index: int) -> None:
+        self._seek_step_ms = self.cmb_seek_step.itemData(index)
 
     def _on_position_changed(self, pos_ms: int) -> None:
         if not self._user_dragging:
@@ -339,6 +358,24 @@ class AnnotateWindow(QDialog):
         self.save_requested.emit(self._video_path, annotation)
         self.accept()
 
+    def _on_save_and_next_clicked(self) -> None:
+        # Same validation as _on_save_clicked
+        process_name = self.edt_process.text().strip()
+        if not process_name:
+            QMessageBox.warning(self, S.DLG_VALIDATE_TITLE, S.DLG_VALIDATE_PROCESS_EMPTY)
+            self.edt_process.setFocus()
+            return
+        parts = [self.lst_parts.item(i).text() for i in range(self.lst_parts.count())]
+        if not parts:
+            QMessageBox.warning(self, S.DLG_VALIDATE_TITLE, S.DLG_VALIDATE_PARTS_EMPTY)
+            self.edt_part.setFocus()
+            return
+        annotation = Annotation(process_name=process_name, parts_involved=parts)
+
+        self._release_player()
+        self.save_and_next_requested.emit(self._video_path, annotation)
+        self.accept()
+
     def _release_player(self) -> None:
         self.player.stop()
         self.player.setSource(QUrl())
@@ -360,6 +397,25 @@ class AnnotateWindow(QDialog):
             if isinstance(focus, QLineEdit):
                 event.accept()
                 return
+        # Space key toggles play/pause
+        elif event.key() == Qt.Key_Space:
+            self._on_play_clicked()
+            event.accept()
+            return
+        # Left/Right arrow keys seek backward/forward
+        elif event.key() == Qt.Key_Left:
+            current = self.player.position()
+            new_pos = max(0, current - self._seek_step_ms)
+            self.player.setPosition(new_pos)
+            event.accept()
+            return
+        elif event.key() == Qt.Key_Right:
+            current = self.player.position()
+            duration = self.player.duration()
+            new_pos = min(duration, current + self._seek_step_ms)
+            self.player.setPosition(new_pos)
+            event.accept()
+            return
         super().keyPressEvent(event)
 
 

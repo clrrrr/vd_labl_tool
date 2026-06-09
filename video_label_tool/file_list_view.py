@@ -438,6 +438,16 @@ class FileListView(QWidget):
         """True if a background save is currently in flight for ``path``."""
         return path in self._active_saves
 
+    def get_next_video(self, current_path: Path) -> Path | None:
+        """Return the path of the next video after current_path, or None if it's the last one."""
+        row_idx = self.model.find_row_by_path(current_path)
+        if row_idx < 0:
+            return None
+        next_idx = row_idx + 1
+        if next_idx >= len(self.model._rows):
+            return None
+        return self.model._rows[next_idx].path
+
     def request_save(self, path: Path, annotation: Annotation) -> None:
         """Spawn a background save worker for ``annotation`` on ``path``.
 

@@ -31,11 +31,29 @@ class MainWindow(QMainWindow):
     def _open_annotate_window_with_prefill(self, path: Path, parts: list) -> None:
         self._show_annotate(path, prefilled_parts=list(parts))
 
+    def _on_save_and_next(self, path: Path, annotation: object) -> None:
+        # 1. Save current video
+        self.file_list.request_save(path, annotation)
+
+        # 2. Get next video path
+        next_path = self.file_list.get_next_video(path)
+
+        # 3. Open next video if available
+        if next_path:
+            self._show_annotate(next_path, prefilled_parts=None)
+        else:
+            QMessageBox.information(
+                self,
+                S.APP_TITLE,
+                "已经是最后一个视频了"
+            )
+
     def _show_annotate(self, path: Path, *, prefilled_parts: list | None) -> None:
         dlg = AnnotateWindow(path, self, prefilled_parts=prefilled_parts)
         # Save is fire-and-forget — AnnotateWindow emits, FileListView owns
         # the background worker and refreshes its row when the file lands.
         dlg.save_requested.connect(self.file_list.request_save)
+        dlg.save_and_next_requested.connect(self._on_save_and_next)
         dlg.setWindowModality(Qt.ApplicationModal)
         dlg.exec()
 
