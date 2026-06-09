@@ -131,6 +131,8 @@ class AnnotateWindow(QDialog):
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         # Black background so the area looks like a player even before load.
         self.video_widget.setStyleSheet("background-color: black;")
+        # Allow video widget to receive focus so keyboard shortcuts work
+        self.video_widget.setFocusPolicy(Qt.ClickFocus)
         v.addWidget(self.video_widget, 1)
 
         # Seek row: current time | slider | total time
@@ -446,29 +448,30 @@ class AnnotateWindow(QDialog):
         super().closeEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 — Qt API
+        # Left/Right arrow keys seek backward/forward (higher priority)
+        # Don't handle if focus is in the parts list (needs arrows for navigation)
+        focus = self.focusWidget()
+        if event.key() == Qt.Key_Left and focus != self.lst_parts:
+            current = self.player.position()
+            new_pos = max(0, current - self._seek_step_ms)
+            self.player.setPosition(new_pos)
+            event.accept()
+            return
+        elif event.key() == Qt.Key_Right and focus != self.lst_parts:
+            current = self.player.position()
+            duration = self.player.duration()
+            new_pos = min(duration, current + self._seek_step_ms)
+            self.player.setPosition(new_pos)
+            event.accept()
+            return
         # Don't let Enter inside a text field close the dialog.
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            focus = self.focusWidget()
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
             if isinstance(focus, QLineEdit):
                 event.accept()
                 return
         # Space key toggles play/pause
         elif event.key() == Qt.Key_Space:
             self._on_play_clicked()
-            event.accept()
-            return
-        # Left/Right arrow keys seek backward/forward
-        elif event.key() == Qt.Key_Left:
-            current = self.player.position()
-            new_pos = max(0, current - self._seek_step_ms)
-            self.player.setPosition(new_pos)
-            event.accept()
-            return
-        elif event.key() == Qt.Key_Right:
-            current = self.player.position()
-            duration = self.player.duration()
-            new_pos = min(duration, current + self._seek_step_ms)
-            self.player.setPosition(new_pos)
             event.accept()
             return
         super().keyPressEvent(event)
