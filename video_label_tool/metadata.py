@@ -210,16 +210,6 @@ def _write_annotation_ffmpeg(video_path: Path, annotation: Annotation) -> None:
     QMediaPlayer source) before invoking this — Windows holds an exclusive
     rename lock otherwise.
     """
-
-    Uses ``ffmpeg -c copy`` so no re-encoding happens — operation is I/O bound,
-    not CPU bound, and preserves all streams losslessly. The original file is
-    replaced atomically via ``os.replace``; on any failure the original is left
-    untouched and the temp output is cleaned up.
-
-    The caller MUST release any open handle to ``video_path`` (e.g. close the
-    QMediaPlayer source) before invoking this — Windows holds an exclusive
-    rename lock otherwise.
-    """
     ffmpeg = ffbin.ffmpeg_path()
     if not ffmpeg:
         raise MetadataError("ffmpeg binary not found")
