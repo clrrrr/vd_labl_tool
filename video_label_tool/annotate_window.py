@@ -363,6 +363,8 @@ class AnnotateWindow(QDialog):
     def _on_remove_part(self) -> None:
         for item in self.lst_parts.selectedItems():
             self.lst_parts.takeItem(self.lst_parts.row(item))
+        # Set focus back to the input field so space key works for play/pause
+        self.edt_part.setFocus()
 
     # --- Save flow ----------------------------------------------------------
 
@@ -423,6 +425,8 @@ class AnnotateWindow(QDialog):
         # Load next video or show message
         if next_path:
             self._reload_video_and_form(next_path)
+            # Set focus to process name field to avoid space key triggering the button
+            self.edt_process.setFocus()
         else:
             QMessageBox.information(self, S.APP_TITLE, "已经是最后一个视频了")
             self.accept()
