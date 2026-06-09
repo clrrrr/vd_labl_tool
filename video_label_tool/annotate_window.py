@@ -242,11 +242,23 @@ class AnnotateWindow(QDialog):
         except MetadataError:
             existing = None
 
-        # Process name: extract text after the first underscore in filename.
-        # Examples: "00001_安装_镜头" -> "安装_镜头", "factory_安装镜头" -> "安装镜头"
-        # If no underscore, leave empty; JSON fallback if no filename suffix.
+        # Process name: extract from filename based on underscore count.
+        # Pattern 1: "工序名" (no underscore) -> use entire stem
+        # Pattern 2: "xxxxx_工序名" (1 underscore) -> after first underscore
+        # Pattern 3: "xxxxx_xxxxx_工序名" (2+ underscores) -> after last underscore
         stem = self._video_path.stem
-        process_from_name = stem.split('_', 1)[1] if '_' in stem else ""
+        underscore_count = stem.count('_')
+
+        if underscore_count == 0:
+            # Pattern 1: entire filename is process name
+            process_from_name = stem
+        elif underscore_count == 1:
+            # Pattern 2: after first underscore
+            process_from_name = stem.split('_', 1)[1] if '_' in stem else ""
+        else:
+            # Pattern 3: after last underscore (2+ underscores)
+            process_from_name = stem.rsplit('_', 1)[-1] if '_' in stem else ""
+
         if process_from_name:
             self.edt_process.setText(process_from_name)
         elif existing is not None and existing.process_name:
@@ -269,7 +281,6 @@ class AnnotateWindow(QDialog):
         # Stop and release current video
         self.player.stop()
         self.player.setSource(QUrl())
-        QApplication.processEvents()
 
         # Update path and window title
         self._video_path = new_path
@@ -279,9 +290,9 @@ class AnnotateWindow(QDialog):
         self.edt_process.clear()
         self.lst_parts.clear()
 
-        # Reload annotation and video
-        self._load_existing_annotation()
-        self._load_video()
+        # Reload annotation and video (delayed to avoid blocking during save)
+        QTimer.singleShot(100, self._load_existing_annotation)
+        QTimer.singleShot(150, self._load_video)
 
     def on_save_completed(self, saved_path: Path) -> None:
         """Called by parent when a save operation completes."""
@@ -436,8 +447,8 @@ class AnnotateWindow(QDialog):
     def _release_player(self) -> None:
         self.player.stop()
         self.player.setSource(QUrl())
-        # Let Qt and the underlying media backend process the source change.
-        QApplication.processEvents()
+        # Removed processEvents() - it blocks UI on slow drives
+        # Qt will handle cleanup asynchronously
 
     # --- Window lifecycle ---------------------------------------------------
 

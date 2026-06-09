@@ -189,33 +189,21 @@ def write_annotation(video_path: Path, annotation: Annotation) -> None:
         f".{video_path.stem}.writing.{uuid.uuid4().hex[:8]}{video_path.suffix}"
     )
 
-    # Write the ffmetadata file in the OS temp dir.
-    meta_fd, meta_name = tempfile.mkstemp(suffix=".ffmeta", prefix="vlt_")
-    meta_path = Path(meta_name)
     try:
-        with os.fdopen(meta_fd, "w", encoding="utf-8") as f:
-            f.write(";FFMETADATA1\n")
-            f.write(f"comment={_escape_ffmeta(comment_value)}\n")
-
-        # Keep video / audio / subtitle / attachment streams from the input;
-        # explicitly drop data streams (GoPro GPMF, iPhone "mebx" gyro tracks,
-        # etc.) since ffmpeg can't always mux those back into MP4 with -c copy
-        # and fails with "could not find tag for codec none". Doing this with
-        # explicit -map 0:v? / 0:a? etc. (the "?" suffix means "optional")
-        # is more robust than -map 0 + -ignore_unknown.
+        # Simplified ffmpeg command: directly set metadata, stream copy only
+        # Drop data streams to avoid "could not find tag for codec none" errors
         cmd = [
             ffmpeg,
             "-hide_banner",
             "-loglevel", "error",
             "-y",
             "-i", str(video_path),
-            "-i", str(meta_path),
             "-map", "0:v?",
             "-map", "0:a?",
             "-map", "0:s?",
             "-map", "0:t?",
-            "-map_metadata", "1",
             "-c", "copy",
+            "-metadata", f"comment={comment_value}",
             str(out_path),
         ]
         try:
@@ -232,10 +220,7 @@ def write_annotation(video_path: Path, annotation: Annotation) -> None:
 
         os.replace(out_path, video_path)
     finally:
-        try:
-            meta_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # Clean up temp output file if it still exists
         try:
             if out_path.exists():
                 out_path.unlink()
