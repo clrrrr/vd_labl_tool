@@ -149,7 +149,7 @@ class AnnotateWindow(QDialog):
         self.cmb_speed = QComboBox()
         for label, _ in self.SPEED_OPTIONS:
             self.cmb_speed.addItem(label)
-        self.cmb_speed.setCurrentIndex(1)  # 1.0x
+        self.cmb_speed.setCurrentIndex(2)  # 1.5x
         self.cmb_speed.currentIndexChanged.connect(self._on_speed_changed)
         ctrls.addWidget(self.cmb_speed)
 
@@ -168,6 +168,9 @@ class AnnotateWindow(QDialog):
         self.cmb_seek_step.addItem("3秒", 3000)
         self.cmb_seek_step.addItem("5秒", 5000)
         self.cmb_seek_step.addItem("10秒", 10000)
+        self.cmb_seek_step.addItem("20秒", 20000)
+        self.cmb_seek_step.addItem("30秒", 30000)
+        self.cmb_seek_step.addItem("40秒", 40000)
         self.cmb_seek_step.setCurrentIndex(1)  # 默认5秒
         self.cmb_seek_step.currentIndexChanged.connect(self._on_seek_step_changed)
         ctrls.addWidget(self.cmb_seek_step)
