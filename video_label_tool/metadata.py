@@ -26,6 +26,12 @@ from pathlib import Path
 
 from . import ffbin
 
+try:
+    from mutagen.mp4 import MP4
+    MUTAGEN_AVAILABLE = True
+except ImportError:
+    MUTAGEN_AVAILABLE = False
+
 
 @dataclass(frozen=True)
 class Annotation:
@@ -163,8 +169,47 @@ def read_video_info(video_path: Path) -> tuple[Annotation | None, float | None]:
     return annotation, duration
 
 
-def write_annotation(video_path: Path, annotation: Annotation) -> None:
+def write_annotation(video_path: Path, annotation: Annotation, retry_callback=None) -> None:
     """Write the annotation JSON into the video file's comment metadata.
+
+    First tries mutagen (fast, in-place modification) for MP4 files.
+    Falls back to ffmpeg if mutagen fails or file is not MP4.
+
+    retry_callback: Optional function to call when falling back to ffmpeg.
+    """
+    # Try mutagen first for MP4 files (fast)
+    if MUTAGEN_AVAILABLE and video_path.suffix.lower() in ('.mp4', '.m4v'):
+        try:
+            _write_annotation_mutagen(video_path, annotation)
+            return
+        except Exception as e:
+            # Mutagen failed, notify and fall back to ffmpeg
+            if retry_callback:
+                retry_callback(f"mutagen失败({type(e).__name__}),切换到ffmpeg重试...")
+
+    # Fall back to ffmpeg (slower but more robust)
+    _write_annotation_ffmpeg(video_path, annotation)
+
+
+def _write_annotation_mutagen(video_path: Path, annotation: Annotation) -> None:
+    """Fast in-place metadata write using mutagen (MP4 only)."""
+    video = MP4(str(video_path))
+    video["\xa9cmt"] = annotation.to_json()  # MP4 comment atom
+    video.save()
+
+
+def _write_annotation_ffmpeg(video_path: Path, annotation: Annotation) -> None:
+    """Write the annotation JSON into the video file's comment metadata using ffmpeg.
+
+    Uses ``ffmpeg -c copy`` so no re-encoding happens — operation is I/O bound,
+    not CPU bound, and preserves all streams losslessly. The original file is
+    replaced atomically via ``os.replace``; on any failure the original is left
+    untouched and the temp output is cleaned up.
+
+    The caller MUST release any open handle to ``video_path`` (e.g. close the
+    QMediaPlayer source) before invoking this — Windows holds an exclusive
+    rename lock otherwise.
+    """
 
     Uses ``ffmpeg -c copy`` so no re-encoding happens — operation is I/O bound,
     not CPU bound, and preserves all streams losslessly. The original file is

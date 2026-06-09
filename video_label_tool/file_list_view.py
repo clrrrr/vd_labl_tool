@@ -175,6 +175,7 @@ class _BackgroundSaveWorker(QObject):
     """
 
     finished = Signal(object, object, object)  # (video_path, final_path, exception_or_none)
+    retry_info = Signal(str)  # Retry message for UI
 
     def __init__(self, video_path: Path, annotation: Annotation):
         super().__init__()
@@ -187,7 +188,11 @@ class _BackgroundSaveWorker(QObject):
         try:
             parsed = parse_filename_pattern(self._video_path.stem)
             if parsed is None:
-                write_annotation(self._video_path, self._annotation)
+                write_annotation(
+                    self._video_path,
+                    self._annotation,
+                    retry_callback=lambda msg: self.retry_info.emit(msg)
+                )
             else:
                 factory_id, _, _ = parsed
                 final_path = write_annotation_and_rename(
@@ -471,6 +476,7 @@ class FileListView(QWidget):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_save_finished)
+        worker.retry_info.connect(self._on_save_retry)
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -485,6 +491,12 @@ class FileListView(QWidget):
         else:
             self.lbl_saving.setText(S.SAVING_BANNER_TEMPLATE.format(n=n))
             self.lbl_saving.setVisible(True)
+
+    def _on_save_retry(self, msg: str) -> None:
+        """Update banner when save retries with ffmpeg."""
+        n = len(self._active_saves)
+        self.lbl_saving.setText(f"{S.SAVING_BANNER_TEMPLATE.format(n=n)} - {msg}")
+        self.lbl_saving.setVisible(True)
 
     # --- Slots --------------------------------------------------------------
 
