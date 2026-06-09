@@ -61,7 +61,6 @@ class AnnotateWindow(QDialog):
     SPEED_OPTIONS = [("0.5x", 0.5), ("1.0x", 1.0), ("1.5x", 1.5), ("2.0x", 2.0)]
 
     save_requested = Signal(Path, object)  # path, Annotation
-    save_and_next_requested = Signal(Path, object)  # path, Annotation
 
     def __init__(
         self,
@@ -69,12 +68,15 @@ class AnnotateWindow(QDialog):
         parent: QWidget | None = None,
         *,
         prefilled_parts: list[str] | None = None,
+        get_next_video_callback=None,
     ) -> None:
         super().__init__(parent)
         self._video_path = video_path
         self._user_dragging = False
         self._prefilled_parts = list(prefilled_parts) if prefilled_parts else []
         self._seek_step_ms = 5000  # 默认跳跃5秒
+        self._get_next_video_callback = get_next_video_callback
+        self._pending_save_path = None  # 记录正在保存的视频路径
 
         self.setWindowTitle(S.ANNO_TITLE_TEMPLATE.format(filename=video_path.name))
         self.resize(1100, 650)
@@ -97,6 +99,15 @@ class AnnotateWindow(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.addWidget(splitter, 1)
+
+        # Saving status banner
+        self.lbl_saving = QLabel("")
+        self.lbl_saving.setStyleSheet(
+            "color: #b00020; font-weight: bold; padding: 4px 6px; "
+            "background-color: #fff4f4; border: 1px solid #f5c2c7; border-radius: 4px;"
+        )
+        self.lbl_saving.setVisible(False)
+        root.addWidget(self.lbl_saving)
 
         bottom = QHBoxLayout()
         bottom.addStretch(1)
@@ -154,26 +165,14 @@ class AnnotateWindow(QDialog):
         ctrls.addWidget(self.cmb_speed)
 
         ctrls.addSpacing(12)
-        ctrls.addWidget(QLabel("🔊"))
-        self.slider_vol = QSlider(Qt.Horizontal)
-        self.slider_vol.setRange(0, 100)
-        self.slider_vol.setValue(70)
-        self.slider_vol.setFixedWidth(120)
-        self.slider_vol.valueChanged.connect(self._on_volume_changed)
-        ctrls.addWidget(self.slider_vol)
-
-        ctrls.addSpacing(12)
-        ctrls.addWidget(QLabel("跳跃:"))
-        self.cmb_seek_step = QComboBox()
-        self.cmb_seek_step.addItem("3秒", 3000)
-        self.cmb_seek_step.addItem("5秒", 5000)
-        self.cmb_seek_step.addItem("10秒", 10000)
-        self.cmb_seek_step.addItem("20秒", 20000)
-        self.cmb_seek_step.addItem("30秒", 30000)
-        self.cmb_seek_step.addItem("40秒", 40000)
-        self.cmb_seek_step.setCurrentIndex(1)  # 默认5秒
-        self.cmb_seek_step.currentIndexChanged.connect(self._on_seek_step_changed)
-        ctrls.addWidget(self.cmb_seek_step)
+        self.lbl_seek_step = QLabel("跳5秒")
+        ctrls.addWidget(self.lbl_seek_step)
+        self.slider_seek_step = QSlider(Qt.Horizontal)
+        self.slider_seek_step.setRange(0, 5)  # 6个档位: 3,5,10,20,30,40秒
+        self.slider_seek_step.setValue(1)  # 默认5秒
+        self.slider_seek_step.setFixedWidth(120)
+        self.slider_seek_step.valueChanged.connect(self._on_seek_step_changed)
+        ctrls.addWidget(self.slider_seek_step)
 
         ctrls.addStretch(1)
         v.addLayout(ctrls)
@@ -241,11 +240,11 @@ class AnnotateWindow(QDialog):
         except MetadataError:
             existing = None
 
-        # Process name: extract text after the last underscore in filename.
-        # Examples: "00001_安装镜头" -> "安装镜头", "factory_00001_安装镜头" -> "安装镜头"
+        # Process name: extract text after the first underscore in filename.
+        # Examples: "00001_安装_镜头" -> "安装_镜头", "factory_安装镜头" -> "安装镜头"
         # If no underscore, leave empty; JSON fallback if no filename suffix.
         stem = self._video_path.stem
-        process_from_name = stem.rsplit('_', 1)[-1] if '_' in stem else ""
+        process_from_name = stem.split('_', 1)[1] if '_' in stem else ""
         if process_from_name:
             self.edt_process.setText(process_from_name)
         elif existing is not None and existing.process_name:
@@ -262,6 +261,31 @@ class AnnotateWindow(QDialog):
 
     def _load_video(self) -> None:
         self.player.setSource(QUrl.fromLocalFile(str(self._video_path)))
+
+    def _reload_video_and_form(self, new_path: Path) -> None:
+        """Reload the window with a new video without closing it."""
+        # Stop and release current video
+        self.player.stop()
+        self.player.setSource(QUrl())
+        QApplication.processEvents()
+
+        # Update path and window title
+        self._video_path = new_path
+        self.setWindowTitle(S.ANNO_TITLE_TEMPLATE.format(filename=new_path.name))
+
+        # Clear form
+        self.edt_process.clear()
+        self.lst_parts.clear()
+
+        # Reload annotation and video
+        self._load_existing_annotation()
+        self._load_video()
+
+    def on_save_completed(self, saved_path: Path) -> None:
+        """Called by parent when a save operation completes."""
+        if self._pending_save_path == saved_path:
+            self._pending_save_path = None
+            self.lbl_saving.setVisible(False)
 
     # --- Player slots -------------------------------------------------------
 
@@ -284,7 +308,12 @@ class AnnotateWindow(QDialog):
         self.audio.setVolume(value / 100.0)
 
     def _on_seek_step_changed(self, index: int) -> None:
-        self._seek_step_ms = self.cmb_seek_step.itemData(index)
+        # 滑块档位对应的跳跃秒数: [3, 5, 10, 20, 30, 40]
+        steps = [3, 5, 10, 20, 30, 40]
+        if 0 <= index < len(steps):
+            seconds = steps[index]
+            self._seek_step_ms = seconds * 1000
+            self.lbl_seek_step.setText(f"跳{seconds}秒")
 
     def _on_position_changed(self, pos_ms: int) -> None:
         if not self._user_dragging:
@@ -375,9 +404,28 @@ class AnnotateWindow(QDialog):
             return
         annotation = Annotation(process_name=process_name, parts_involved=parts)
 
+        # Get next video path before releasing player
+        if not self._get_next_video_callback:
+            QMessageBox.warning(self, S.APP_TITLE, "无法获取下一个视频")
+            return
+        next_path = self._get_next_video_callback(self._video_path)
+
         self._release_player()
-        self.save_and_next_requested.emit(self._video_path, annotation)
-        self.accept()
+
+        # Show saving banner
+        self._pending_save_path = self._video_path
+        self.lbl_saving.setText(f"正在保存: {self._video_path.name} - 请勿关闭窗口")
+        self.lbl_saving.setVisible(True)
+
+        # Emit save request
+        self.save_requested.emit(self._video_path, annotation)
+
+        # Load next video or show message
+        if next_path:
+            self._reload_video_and_form(next_path)
+        else:
+            QMessageBox.information(self, S.APP_TITLE, "已经是最后一个视频了")
+            self.accept()
 
     def _release_player(self) -> None:
         self.player.stop()

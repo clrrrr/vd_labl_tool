@@ -25,37 +25,34 @@ class MainWindow(QMainWindow):
         self.file_list.paste_to_unannotated.connect(self._open_annotate_window_with_prefill)
         self.setCentralWidget(self.file_list)
 
+        self._current_annotate_window = None  # Track the open annotate window
+
     def _open_annotate_window(self, path: Path) -> None:
         self._show_annotate(path, prefilled_parts=None)
 
     def _open_annotate_window_with_prefill(self, path: Path, parts: list) -> None:
         self._show_annotate(path, prefilled_parts=list(parts))
 
-    def _on_save_and_next(self, path: Path, annotation: object) -> None:
-        # 1. Save current video
-        self.file_list.request_save(path, annotation)
-
-        # 2. Get next video path
-        next_path = self.file_list.get_next_video(path)
-
-        # 3. Open next video if available
-        if next_path:
-            self._show_annotate(next_path, prefilled_parts=None)
-        else:
-            QMessageBox.information(
-                self,
-                S.APP_TITLE,
-                "已经是最后一个视频了"
-            )
-
     def _show_annotate(self, path: Path, *, prefilled_parts: list | None) -> None:
-        dlg = AnnotateWindow(path, self, prefilled_parts=prefilled_parts)
+        dlg = AnnotateWindow(
+            path,
+            self,
+            prefilled_parts=prefilled_parts,
+            get_next_video_callback=self.file_list.get_next_video
+        )
         # Save is fire-and-forget — AnnotateWindow emits, FileListView owns
         # the background worker and refreshes its row when the file lands.
-        dlg.save_requested.connect(self.file_list.request_save)
-        dlg.save_and_next_requested.connect(self._on_save_and_next)
+        dlg.save_requested.connect(self._on_save_requested)
         dlg.setWindowModality(Qt.ApplicationModal)
+        self._current_annotate_window = dlg
         dlg.exec()
+        self._current_annotate_window = None
+
+    def _on_save_requested(self, path: Path, annotation: object) -> None:
+        """Handle save request and notify the annotate window when done."""
+        self.file_list.request_save(path, annotation)
+        # Note: We could add a callback mechanism to notify when save completes,
+        # but for now the banner stays visible during the save operation.
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 — Qt API
         # Refuse to close while background saves are still running. Letting
