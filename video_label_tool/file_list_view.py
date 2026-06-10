@@ -427,10 +427,8 @@ class FileListView(QWidget):
     """Top-level widget: folder picker + video table."""
 
     video_double_clicked = Signal(Path)
-    # Emitted when user pastes a parts list onto an un-annotated video; carries
-    # (path, parts_list). The main window opens the annotate dialog pre-filled
-    # so the user can supply the Process Name before saving.
     paste_to_unannotated = Signal(Path, list)
+    save_completed = Signal(Path, Path)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -828,3 +826,43 @@ class FileListView(QWidget):
         """Temporarily overlay a message on the counts label."""
         self.lbl_counts.setText(message)
         QTimer.singleShot(ms, self._refresh_counts_label)
+
+    def get_next_video(self, current_path: Path) -> Path | None:
+        """Return the next unannotated video after current_path, or None."""
+        rows = self.model._rows
+        try:
+            current_idx = next(i for i, r in enumerate(rows) if r.path == current_path)
+        except StopIteration:
+            return None
+        
+        # Search forward for next unannotated video
+        for i in range(current_idx + 1, len(rows)):
+            if rows[i].status == S.STATUS_TODO:
+                return rows[i].path
+        return None
+
+    def request_save(self, path: Path, annotation: Annotation) -> None:
+        """Spawn a background save worker for the given path and annotation."""
+        if path in self._active_saves:
+            return  # Already saving this file
+        
+        thread = QThread(self)
+        worker = _BackgroundSaveWorker(path, annotation)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_bg_save_finished)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._active_saves[path] = (thread, worker)
+        thread.start()
+
+    def _on_bg_save_finished(self, video_path: Path, final_path: Path, err: Exception | None) -> None:
+        """Handle completion of background save."""
+        self._active_saves.pop(video_path, None)
+        if err is not None:
+            QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, str(err))
+        else:
+            self.save_completed.emit(video_path, final_path)
+        # Refresh the row to show updated status
+        self._rescan_folder()
