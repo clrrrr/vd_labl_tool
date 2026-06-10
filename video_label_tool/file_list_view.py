@@ -53,8 +53,6 @@ from .metadata import (
     write_annotation_and_rename,
 )
 from .project_info_dialog import ProjectInfoDialog
-    write_annotation_and_rename,
-)
 
 VIDEO_SUFFIXES = {".mp4", ".mov"}
 
