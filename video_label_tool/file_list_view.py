@@ -593,8 +593,7 @@ class FileListView(QWidget):
             initial_factory_name=self._factory_name or "",
         )
         if dlg.exec():
-            self._factory_id = dlg.factory_id
-            self._factory_name = dlg.factory_name
+            self._factory_id, self._factory_name = dlg.values()
             self.btn_project_info.setText(
                 S.BTN_PROJECT_INFO_TEMPLATE.format(
                     factory_id=self._factory_id,
