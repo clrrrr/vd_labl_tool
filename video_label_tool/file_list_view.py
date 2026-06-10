@@ -1,7 +1,7 @@
 """Folder view: lists videos with their annotation status.
 
 v0.5 default flow: video files are assumed to already follow the naming
-convention ``{factory_id}_{NNNNN}_{process_name}.{ext}``. No project info
+convention ``{factory_id}{NNNNN}_{process_name}.{ext}``. No project info
 prompt, no folder rename, no batch video rename — just open a folder, list
 its videos, and let the user annotate. The 工序名 column is derived from
 the filename suffix, not the JSON metadata, so un-annotated videos still
@@ -10,6 +10,8 @@ show their intended process name at a glance.
 
 from __future__ import annotations
 
+import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,7 +48,11 @@ from .metadata import (
     MetadataError,
     parse_filename_pattern,
     read_video_info,
+    sanitize_for_filename,
     write_annotation,
+    write_annotation_and_rename,
+)
+from .project_info_dialog import ProjectInfoDialog
     write_annotation_and_rename,
 )
 
@@ -96,15 +102,95 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def rename_videos_to_factory_pattern(
+    folder: Path,
+    factory_id: str,
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Rename every video in folder to {factory_id}NNNNN<ext>."""
+    try:
+        videos = sorted(
+            [p for p in folder.iterdir() if _is_listable_video(p)],
+            key=lambda p: p.name.lower(),
+        )
+    except OSError:
+        return [], []
+
+    if not videos:
+        return [], []
+
+    import re as _re
+    _suffix_re = _re.compile(r"^.*?\d{5}(_.*)?$")
+
+    def _existing_suffix(stem: str) -> str:
+        m = _suffix_re.match(stem)
+        if m and m.group(1):
+            return m.group(1)
+        return ""
+
+    targets = [
+        folder / f"{factory_id}{i + 1:05d}{_existing_suffix(p.stem)}{p.suffix}"
+        for i, p in enumerate(videos)
+    ]
+    if all(p == t for p, t in zip(videos, targets)):
+        return list(videos), []
+
+    temps: list[tuple[Path, Path]] = []
+    errors: list[tuple[Path, str]] = []
+    for src, tgt in zip(videos, targets):
+        if src == tgt:
+            temps.append((src, tgt))
+            continue
+        temp = folder / f".__renaming__{uuid.uuid4().hex[:12]}{src.suffix}"
+        try:
+            os.replace(src, temp)
+            temps.append((temp, tgt))
+        except OSError as e:
+            errors.append((src, str(e)))
+
+    final: list[Path] = []
+    for temp, tgt in temps:
+        if temp == tgt:
+            final.append(tgt)
+            continue
+        try:
+            os.replace(temp, tgt)
+            final.append(tgt)
+        except OSError as e:
+            errors.append((temp, str(e)))
+
+    return final, errors
+
+
+def rename_folder_to_project_pattern(
+    folder: Path,
+    factory_id: str,
+    factory_name: str,
+) -> Path:
+    """Rename folder itself to {factory_id}_{factory_name}."""
+    sanitized_name = sanitize_for_filename(factory_name)
+    target_name = f"{factory_id}_{sanitized_name}" if sanitized_name else factory_id
+    target_path = folder.parent / target_name
+    if target_path == folder:
+        return folder
+    if target_path.exists():
+        return folder
+    try:
+        os.replace(folder, target_path)
+        return target_path
+    except OSError:
+        return folder
+
+
+
 def _video_id_from_stem(stem: str) -> str:
-    """Return the ``{factory_id}_{NNNNN}`` portion of a stem, or the whole
+    """Return the ``{factory_id}{NNNNN}`` portion of a stem, or the whole
     stem if the rename pattern doesn't apply.
     """
     parsed = parse_filename_pattern(stem)
     if parsed is None:
         return stem
     factory_id, video_number, _ = parsed
-    return f"{factory_id}_{video_number}"
+    return f"{factory_id}{video_number}"
 
 
 def _process_name_from_stem(stem: str) -> str:
@@ -340,20 +426,17 @@ class FileListView(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._folder: Path | None = None
-        self._generation = 0  # invalidates stale worker results
+        self._generation = 0
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(8)
+
+        self._factory_id: str | None = None
+        self._factory_name: str | None = None
 
         self._scan_signals = _ScanSignals(self)
         self._scan_signals.done.connect(self._on_scan_done)
 
-        # In-memory clipboard for the right-click copy/paste-parts feature.
-        # Just app-internal — does not touch the OS clipboard.
         self._parts_clipboard: list[str] | None = None
-
-        # Track active save workers so they aren't garbage collected
-        # mid-flight. Keyed by file path. Drives the persistent "保存中"
-        # warning banner and the main-window close guard.
         self._active_saves: dict[Path, tuple[QThread, _BackgroundSaveWorker]] = {}
 
         self.model = VideoTableModel(self)
@@ -365,14 +448,18 @@ class FileListView(QWidget):
         root = QVBoxLayout(self)
 
         top = QHBoxLayout()
+        self.btn_project_info = QPushButton(S.BTN_PROJECT_INFO_PROMPT)
+        self.btn_project_info.clicked.connect(self._on_project_info)
         self.btn_open = QPushButton(S.BTN_OPEN_FOLDER)
         self.btn_open.clicked.connect(self._on_open_folder)
+        self.btn_open.setEnabled(False)
         self.btn_export = QPushButton(S.BTN_EXPORT_XLSX)
         self.btn_export.clicked.connect(self._on_export_xlsx)
         self.btn_export.setEnabled(False)
         self.lbl_folder = QLabel(S.LABEL_NO_FOLDER)
         self.lbl_folder.setStyleSheet("color: #555;")
         self.lbl_folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        top.addWidget(self.btn_project_info)
         top.addWidget(self.btn_open)
         top.addWidget(self.btn_export)
         top.addSpacing(12)
@@ -501,12 +588,47 @@ class FileListView(QWidget):
 
     # --- Slots --------------------------------------------------------------
 
+    def _on_project_info(self) -> None:
+        dlg = ProjectInfoDialog(
+            self,
+            initial_factory_id=self._factory_id or "",
+            initial_factory_name=self._factory_name or "",
+        )
+        if dlg.exec():
+            self._factory_id = dlg.factory_id
+            self._factory_name = dlg.factory_name
+            self.btn_project_info.setText(
+                S.BTN_PROJECT_INFO_TEMPLATE.format(
+                    factory_id=self._factory_id,
+                    factory_name=self._factory_name,
+                )
+            )
+            self.btn_open.setEnabled(True)
+
     def _on_open_folder(self) -> None:
+        if not self._factory_id:
+            return
         start_dir = str(self._folder) if self._folder else str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, S.BTN_OPEN_FOLDER, start_dir)
         if not chosen:
             return
-        self._folder = Path(chosen)
+        
+        folder = Path(chosen)
+        # 1. Rename folder
+        folder = rename_folder_to_project_pattern(folder, self._factory_id, self._factory_name or "")
+        if folder != Path(chosen):
+            pass  # Renamed successfully
+        
+        # 2. Rename videos
+        videos, errors = rename_videos_to_factory_pattern(folder, self._factory_id)
+        if errors:
+            details = "\n".join(f"• {p.name}: {e}" for p, e in errors[:5])
+            if len(errors) > 5:
+                details += f"\n...以及 {len(errors)-5} 个其他文件"
+            QMessageBox.warning(self, S.RENAME_WARNING_TITLE, 
+                              S.RENAME_WARNING_TEMPLATE.format(n=len(errors), details=details))
+        
+        self._folder = folder
         self.lbl_folder.setText(S.LABEL_FOLDER_PREFIX + str(self._folder))
         self.btn_export.setEnabled(True)
         self._rescan_folder()

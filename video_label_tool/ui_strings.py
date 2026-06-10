@@ -4,10 +4,26 @@ APP_TITLE = "视频标注工具"
 
 # Main window
 BTN_OPEN_FOLDER = "选择文件夹"
+BTN_PROJECT_INFO_PROMPT = "填写项目信息(必须)"
+BTN_PROJECT_INFO_TEMPLATE = "项目: {factory_id} · {factory_name} (修改)"
 BTN_EXPORT_XLSX = "导出表格"
 LABEL_NO_FOLDER = "未选择文件夹"
 LABEL_FOLDER_PREFIX = "当前文件夹: "
 LABEL_COUNT_TEMPLATE = "共 {total} 个视频 · 已标注 {done} · 未标注 {todo}"
+
+# Project info dialog
+DLG_PROJECT_INFO_TITLE = "项目信息"
+DLG_PROJECT_INFO_FACTORY_ID = "工厂编号:"
+DLG_PROJECT_INFO_FACTORY_NAME = "工厂名:"
+DLG_PROJECT_INFO_HELP_ID = "字母、数字、下划线、连字符,1–30 字符"
+DLG_PROJECT_INFO_VALIDATE_ID = "工厂编号格式不合法"
+DLG_PROJECT_INFO_VALIDATE_NAME = "工厂名不能为空"
+
+# Rename warnings
+RENAME_WARNING_TITLE = "重命名遇到问题"
+RENAME_WARNING_TEMPLATE = "以下 {n} 个文件未能重命名(可能被其他程序占用):\n\n{details}"
+FOLDER_RENAME_FAIL_TITLE = "文件夹重命名失败"
+FOLDER_RENAME_FAIL_TEMPLATE = "无法将文件夹重命名为 {target}:\n{error}\n\n将继续使用原文件夹名。"
 
 # Export
 DLG_EXPORT_NOTHING_TITLE = "没有可导出内容"
