@@ -23,6 +23,7 @@ class MainWindow(QMainWindow):
         self.file_list = FileListView(self)
         self.file_list.video_double_clicked.connect(self._open_annotate_window)
         self.file_list.paste_to_unannotated.connect(self._open_annotate_window_with_prefill)
+        self.file_list.save_completed.connect(self._on_save_completed)
         self.setCentralWidget(self.file_list)
 
         self._current_annotate_window = None  # Track the open annotate window
@@ -53,6 +54,11 @@ class MainWindow(QMainWindow):
         self.file_list.request_save(path, annotation)
         # Note: We could add a callback mechanism to notify when save completes,
         # but for now the banner stays visible during the save operation.
+
+    def _on_save_completed(self, path: Path) -> None:
+        """Notify the open annotate window that save completed."""
+        if self._current_annotate_window:
+            self._current_annotate_window.on_save_completed(path)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 — Qt API
         # Refuse to close while background saves are still running. Letting

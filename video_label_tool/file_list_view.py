@@ -335,6 +335,7 @@ class FileListView(QWidget):
     # (path, parts_list). The main window opens the annotate dialog pre-filled
     # so the user can supply the Process Name before saving.
     paste_to_unannotated = Signal(Path, list)
+    save_completed = Signal(Path)  # Emitted when background save finishes
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -695,6 +696,11 @@ class FileListView(QWidget):
     ) -> None:
         self._active_saves.pop(video_path, None)
         self._update_saving_banner()
+
+        # Notify that save completed (for AnnotateWindow to update banner)
+        if err is None:
+            self.save_completed.emit(video_path)
+
         if err is not None:
             QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, str(err))
         # If the file was also renamed (process-name suffix), the row's path
