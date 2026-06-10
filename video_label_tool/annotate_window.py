@@ -230,7 +230,7 @@ class AnnotateWindow(QDialog):
         """Populate form fields.
 
         v0.5 default:
-        - 工序名: derived from the filename suffix ({factory_id}_{NNNNN}_{suffix})
+        - 工序名: derived from the filename suffix ({factory_id}{NNNNN}_{suffix})
           if present. If JSON already has a process_name and the filename
           doesn't, fall back to the JSON value (rare).
         - 物品列表: from the JSON annotation if present, otherwise the

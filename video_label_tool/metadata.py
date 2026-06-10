@@ -269,15 +269,14 @@ def _write_annotation_ffmpeg(video_path: Path, annotation: Annotation) -> None:
 _FILENAME_INVALID = set('<>:"/\\|?*\x00')
 
 # Filename pattern produced by the rename pass / save flow:
-# ``{factory_id}_{NNNNN}[_{process_name}].{ext}``. NNNNN is exactly 5 digits.
-# factory_id is non-greedy so the first 5-digit run wins (handles factory_ids
-# that themselves contain underscores).
+# ``{factory_id}{NNNNN}[_{process_name}].{ext}``. NNNNN is exactly 5 digits.
+# factory_id is non-greedy so the first 5-digit run wins.
 import re as _re
-_FILENAME_PATTERN = _re.compile(r"^(.*?)_(\d{5})(?:_(.*))?$")
+_FILENAME_PATTERN = _re.compile(r"^(.*?)(\d{5})(?:_(.*))?$")
 
 
 def parse_filename_pattern(stem: str) -> tuple[str, str, str] | None:
-    """Parse ``{factory_id}_{NNNNN}[_{process_name}]`` from a stem.
+    """Parse ``{factory_id}{NNNNN}[_{process_name}]`` from a stem.
 
     Returns ``(factory_id, video_number, process_name)`` or ``None`` if the
     stem doesn't match the rename pattern. ``process_name`` is the empty
@@ -317,13 +316,13 @@ def compute_path_with_process_suffix(
 ) -> Path:
     """Compute the desired filename for ``current_path`` given the process name.
 
-    Expected current stem: ``{factory_id}_{NNNNN}`` or
-    ``{factory_id}_{NNNNN}_{old_process_name}``. The function strips any old
+    Expected current stem: ``{factory_id}{NNNNN}`` or
+    ``{factory_id}{NNNNN}_{old_process_name}``. The function strips any old
     process-name suffix and appends the sanitized new one. If the current
     stem doesn't match this pattern (the rename pass left it alone for some
     reason), the path is returned unchanged so we don't mangle it.
     """
-    expected_prefix = f"{factory_id}_"
+    expected_prefix = factory_id
     stem = current_path.stem
     if not stem.startswith(expected_prefix):
         return current_path
@@ -333,9 +332,9 @@ def compute_path_with_process_suffix(
     video_number = rest[:5]
     sanitized = sanitize_for_filename(process_name)
     new_stem = (
-        f"{factory_id}_{video_number}_{sanitized}"
+        f"{factory_id}{video_number}_{sanitized}"
         if sanitized
-        else f"{factory_id}_{video_number}"
+        else f"{factory_id}{video_number}"
     )
     return current_path.with_name(f"{new_stem}{current_path.suffix}")
 

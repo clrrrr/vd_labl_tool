@@ -1,15 +1,14 @@
 """Folder view: lists videos with their annotation status.
 
-v0.5 default flow: video files are assumed to already follow the naming
-convention ``{factory_id}_{NNNNN}_{process_name}.{ext}``. No project info
-prompt, no folder rename, no batch video rename — just open a folder, list
-its videos, and let the user annotate. The 工序名 column is derived from
-the filename suffix, not the JSON metadata, so un-annotated videos still
-show their intended process name at a glance.
+Scans the selected folder for ``*.mp4`` / ``*.mov``, runs ffprobe in a thread
+pool to read each file's annotation, and displays results in a table. The UI
+thread never blocks on ffprobe.
 """
 
 from __future__ import annotations
 
+import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +26,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -44,11 +44,12 @@ from .export import ExportRow, export_to_xlsx
 from .metadata import (
     Annotation,
     MetadataError,
-    parse_filename_pattern,
     read_video_info,
+    sanitize_for_filename,
     write_annotation,
     write_annotation_and_rename,
 )
+from .project_info_dialog import ProjectInfoDialog
 
 VIDEO_SUFFIXES = {".mp4", ".mov"}
 
@@ -58,9 +59,10 @@ def _is_listable_video(p: Path) -> bool:
 
     Excludes anything starting with ``.`` (camera files never have leading
     dots; on macOS ``._filename`` resource forks also get filtered out) and
-    in particular our own intermediate write temp files
-    (``.{name}.writing.{hex}<ext>``) which would otherwise be picked up by
-    the scanner if the previous run crashed mid-write.
+    in particular our own intermediate write/rename temp files
+    (``.{name}.writing.{hex}<ext>`` and ``.__renaming__{hex}<ext>``) which
+    would otherwise be picked up by the scanner if the previous run crashed
+    mid-write.
     """
     if not p.is_file():
         return False
@@ -96,24 +98,18 @@ def _fmt_duration(seconds: float | None) -> str:
     return f"{m:02d}:{s:02d}"
 
 
-def _video_id_from_stem(stem: str) -> str:
-    """Return the ``{factory_id}_{NNNNN}`` portion of a stem, or the whole
-    stem if the rename pattern doesn't apply.
+def _extract_video_number(stem: str) -> str:
+    """Pull the trailing ``NNNNN`` out of a renamed filename stem.
+
+    Inputs like ``FAC123_00005`` → ``"00005"``. If the stem doesn't follow
+    the rename pattern (rare; only possible if the rename pass left
+    something behind), fall back to the whole stem so the row still has
+    *something* identifying it.
     """
-    parsed = parse_filename_pattern(stem)
-    if parsed is None:
-        return stem
-    factory_id, video_number, _ = parsed
-    return f"{factory_id}_{video_number}"
-
-
-def _process_name_from_stem(stem: str) -> str:
-    """Return the trailing process-name component of a stem, or ``""``."""
-    parsed = parse_filename_pattern(stem)
-    if parsed is None:
-        return ""
-    _, _, process_name = parsed
-    return process_name
+    parts = stem.rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[1]
+    return stem
 
 
 @dataclass
@@ -125,9 +121,121 @@ class VideoRow:
     annotation: Annotation | None = None  # populated when status == STATUS_DONE
     duration_seconds: float | None = None  # filled in by the scan task
 
-    @property
-    def process_name_from_filename(self) -> str:
-        return _process_name_from_stem(self.path.stem)
+
+# --- Rename -----------------------------------------------------------------
+
+def rename_videos_to_factory_pattern(
+    folder: Path,
+    factory_id: str,
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Rename every video in ``folder`` to ``{factory_id}NNNNN<ext>``.
+
+    Ordering: original filenames sorted case-insensitively (matches the file
+    list view's display order). Index N is zero-padded to 5 digits starting
+    at 00000. The original extension is preserved verbatim (case included).
+
+    Idempotent — if all files already match their expected names, this does
+    nothing. When any rename is needed, all sources are first renamed to
+    unique temp names (``.__renaming__<hex>.<ext>``) and then to their final
+    targets. This two-phase shuffle avoids collisions when the new and old
+    names overlap (e.g. running with a different factory_id over an already
+    renamed folder).
+
+    Returns ``(final_paths_in_order, errors)`` where ``errors`` is a list of
+    ``(original_path, message)`` for any file that couldn't be renamed
+    (typically because of a Windows file lock or permission issue). Failed
+    files are left untouched; their original entry is omitted from
+    ``final_paths_in_order``.
+    """
+    try:
+        videos = sorted(
+            [p for p in folder.iterdir() if _is_listable_video(p)],
+            key=lambda p: p.name.lower(),
+        )
+    except OSError:
+        return [], []
+
+    if not videos:
+        return [], []
+
+    # Preserve any existing process-name suffix (the ``_工序名`` we appended on
+    # save). Without this, re-running the rename pass — e.g. after the user
+    # changes the factory id or re-selects the same folder — would silently
+    # strip the suffix and the file would lose its display name.
+    import re as _re
+    _suffix_re = _re.compile(r"^.*?\d{5}(_.*)?$")
+
+    def _existing_suffix(stem: str) -> str:
+        m = _suffix_re.match(stem)
+        if m and m.group(1):
+            return m.group(1)
+        return ""
+
+    targets = [
+        folder / f"{factory_id}{i + 1:05d}{_existing_suffix(p.stem)}{p.suffix}"
+        for i, p in enumerate(videos)
+    ]
+    if all(p == t for p, t in zip(videos, targets)):
+        return list(videos), []  # already correctly named
+
+    # Phase 1: move every source to a unique temp name.
+    temps: list[tuple[Path, Path]] = []  # (temp_path, intended_target)
+    errors: list[tuple[Path, str]] = []
+    for src, tgt in zip(videos, targets):
+        if src == tgt:
+            # Already at the right name — skip both phases for this file.
+            temps.append((src, tgt))
+            continue
+        temp = folder / f".__renaming__{uuid.uuid4().hex[:12]}{src.suffix}"
+        try:
+            os.replace(src, temp)
+            temps.append((temp, tgt))
+        except OSError as e:
+            errors.append((src, str(e)))
+
+    # Phase 2: rename temps to their final targets.
+    final: list[Path] = []
+    for temp, tgt in temps:
+        if temp == tgt:
+            final.append(tgt)
+            continue
+        try:
+            os.replace(temp, tgt)
+            final.append(tgt)
+        except OSError as e:
+            errors.append((temp, str(e)))
+            # Leave the temp file in place rather than risk losing data —
+            # the user can recover it from disk.
+
+    return final, errors
+
+
+def rename_folder_to_project_pattern(
+    folder: Path,
+    factory_id: str,
+    factory_name: str,
+) -> tuple[Path, str | None]:
+    """Rename ``folder`` itself to ``{factory_id}_{factory_name}``.
+
+    Returns ``(folder_path_after, error_or_none)``. On success, the returned
+    path is the new folder location. On failure (target exists, OS error,
+    permission denied, file lock on a parent process), the returned path is
+    the original ``folder`` and the error message is non-None. Idempotent —
+    when the folder already has the right name, returns the original path
+    with no error and without touching the filesystem.
+    """
+    sanitized_name = sanitize_for_filename(factory_name)
+    target_name = f"{factory_id}_{sanitized_name}" if sanitized_name else factory_id
+    if folder.name == target_name:
+        return folder, None
+    new_path = folder.parent / target_name
+    if new_path.exists():
+        return folder, f"目标文件夹已存在: {new_path.name}"
+    try:
+        os.rename(folder, new_path)
+    except OSError as e:
+        return folder, str(e)
+    return new_path, None
 
 
 # --- Worker -----------------------------------------------------------------
@@ -162,42 +270,32 @@ class _ScanTask(QRunnable):
         self._signals.done.emit(self._gen, self._row, annotation, duration, err)
 
 
-class _BackgroundSaveWorker(QObject):
-    """Writes an annotation in a worker thread.
+class _PasteSaveWorker(QObject):
+    """Writes an annotation in a worker thread (used by right-click paste).
 
-    Used by both the AnnotateWindow save flow (after the dialog closes) and
-    the right-click paste flow. The ``finished`` signal carries
-    ``(video_path, final_path, exception_or_none)``. Each worker owns its
-    own signal so signal/slot connections are scoped to a single save's
-    lifecycle.
-
-    factory_id is parsed from the filename itself (no project-info state).
+    The ``finished`` signal carries ``(video_path, final_path, exception_or_none)``.
+    ``video_path`` is the path the user pasted onto; ``final_path`` is the
+    same path or its renamed version after the process-name suffix is
+    appended. Each worker owns its own signal so signal/slot connections
+    are scoped to a single paste-save lifecycle and auto-disconnect cleanly
+    when the worker is destroyed.
     """
 
     finished = Signal(object, object, object)  # (video_path, final_path, exception_or_none)
-    retry_info = Signal(str)  # Retry message for UI
 
-    def __init__(self, video_path: Path, annotation: Annotation):
+    def __init__(self, video_path: Path, annotation: Annotation, factory_id: str):
         super().__init__()
         self._video_path = video_path
         self._annotation = annotation
+        self._factory_id = factory_id
 
     def run(self) -> None:
         err: Exception | None = None
         final_path = self._video_path
         try:
-            parsed = parse_filename_pattern(self._video_path.stem)
-            if parsed is None:
-                write_annotation(
-                    self._video_path,
-                    self._annotation,
-                    retry_callback=lambda msg: self.retry_info.emit(msg)
-                )
-            else:
-                factory_id, _, _ = parsed
-                final_path = write_annotation_and_rename(
-                    self._video_path, self._annotation, factory_id,
-                )
+            final_path = write_annotation_and_rename(
+                self._video_path, self._annotation, self._factory_id,
+            )
         except Exception as e:  # noqa: BLE001 — surfaced to the UI
             err = e
         self.finished.emit(self._video_path, final_path, err)
@@ -250,9 +348,7 @@ class VideoTableModel(QAbstractTableModel):
             if col == COL_STATUS:
                 return row.status
             if col == COL_PROCESS:
-                # v0.5: derive from filename suffix rather than JSON. Stays
-                # populated even before the video is annotated.
-                return row.process_name_from_filename
+                return row.annotation.process_name if row.annotation else ""
             if col == COL_DURATION:
                 return _fmt_duration(row.duration_seconds)
             if col == COL_SIZE:
@@ -335,7 +431,6 @@ class FileListView(QWidget):
     # (path, parts_list). The main window opens the annotate dialog pre-filled
     # so the user can supply the Process Name before saving.
     paste_to_unannotated = Signal(Path, list)
-    save_completed = Signal(Path)  # Emitted when background save finishes
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -344,6 +439,12 @@ class FileListView(QWidget):
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(8)
 
+        # Project info — set via the "填写项目信息" button. Must be filled
+        # before the user can pick a folder, since the folder selection step
+        # renames files using the factory_id.
+        self._factory_id: str | None = None
+        self._factory_name: str | None = None
+
         self._scan_signals = _ScanSignals(self)
         self._scan_signals.done.connect(self._on_scan_done)
 
@@ -351,10 +452,9 @@ class FileListView(QWidget):
         # Just app-internal — does not touch the OS clipboard.
         self._parts_clipboard: list[str] | None = None
 
-        # Track active save workers so they aren't garbage collected
-        # mid-flight. Keyed by file path. Drives the persistent "保存中"
-        # warning banner and the main-window close guard.
-        self._active_saves: dict[Path, tuple[QThread, _BackgroundSaveWorker]] = {}
+        # Track active paste-save workers so they aren't garbage collected
+        # mid-flight. Keyed by file path.
+        self._active_saves: dict[Path, tuple[QThread, _PasteSaveWorker]] = {}
 
         self.model = VideoTableModel(self)
 
@@ -365,6 +465,8 @@ class FileListView(QWidget):
         root = QVBoxLayout(self)
 
         top = QHBoxLayout()
+        self.btn_project_info = QPushButton(S.BTN_PROJECT_INFO_PROMPT)
+        self.btn_project_info.clicked.connect(self._on_project_info)
         self.btn_open = QPushButton(S.BTN_OPEN_FOLDER)
         self.btn_open.clicked.connect(self._on_open_folder)
         self.btn_export = QPushButton(S.BTN_EXPORT_XLSX)
@@ -373,6 +475,7 @@ class FileListView(QWidget):
         self.lbl_folder = QLabel(S.LABEL_NO_FOLDER)
         self.lbl_folder.setStyleSheet("color: #555;")
         self.lbl_folder.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        top.addWidget(self.btn_project_info)
         top.addWidget(self.btn_open)
         top.addWidget(self.btn_export)
         top.addSpacing(12)
@@ -382,16 +485,6 @@ class FileListView(QWidget):
         self.lbl_counts = QLabel("")
         self.lbl_counts.setStyleSheet("color: #555; padding: 2px 0;")
         root.addWidget(self.lbl_counts)
-
-        # Persistent warning banner shown while any background save is
-        # running. Hidden when there are no active saves.
-        self.lbl_saving = QLabel("")
-        self.lbl_saving.setStyleSheet(
-            "color: #b00020; font-weight: bold; padding: 4px 6px; "
-            "background-color: #fff4f4; border: 1px solid #f5c2c7; border-radius: 4px;"
-        )
-        self.lbl_saving.setVisible(False)
-        root.addWidget(self.lbl_saving)
 
         self.table = QTableView()
         self.table.setModel(self.model)
@@ -431,77 +524,51 @@ class FileListView(QWidget):
         """Re-list the current folder when a file's path has changed.
 
         Used by save flows that rename the underlying file (process-name
-        suffix).
+        suffix). Does NOT re-run the factory-id rename pass — just scans.
         """
         if self._folder is not None:
             self._rescan_folder()
 
-    def has_active_saves(self) -> bool:
-        """True while at least one background save is still running."""
-        return bool(self._active_saves)
-
-    def is_saving(self, path: Path) -> bool:
-        """True if a background save is currently in flight for ``path``."""
-        return path in self._active_saves
-
-    def get_next_video(self, current_path: Path) -> Path | None:
-        """Return the path of the next video after current_path, or None if it's the last one."""
-        row_idx = self.model.find_row_by_path(current_path)
-        if row_idx < 0:
-            return None
-        next_idx = row_idx + 1
-        if next_idx >= len(self.model._rows):
-            return None
-        return self.model._rows[next_idx].path
-
-    def request_save(self, path: Path, annotation: Annotation) -> None:
-        """Spawn a background save worker for ``annotation`` on ``path``.
-
-        Idempotent against the same path — if a save is already running for
-        it, the request is ignored (we can't have two writers racing on the
-        same file). When the save finishes, the model row is refreshed
-        automatically (the file path may have changed if the process-name
-        suffix was rewritten).
-        """
-        if path in self._active_saves:
-            return
-
-        row_idx = self.model.find_row_by_path(path)
-        if row_idx >= 0:
-            current = self.model._rows[row_idx]
-            self.model.update_row_status(row_idx, S.STATUS_SAVING, current.annotation)
-            self._refresh_counts_label()
-
-        thread = QThread(self)
-        worker = _BackgroundSaveWorker(path, annotation)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_save_finished)
-        worker.retry_info.connect(self._on_save_retry)
-        worker.finished.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        self._active_saves[path] = (thread, worker)
-        self._update_saving_banner()
-        thread.start()
-
-    def _update_saving_banner(self) -> None:
-        n = len(self._active_saves)
-        if n == 0:
-            self.lbl_saving.setVisible(False)
-        else:
-            self.lbl_saving.setText(S.SAVING_BANNER_TEMPLATE.format(n=n))
-            self.lbl_saving.setVisible(True)
-
-    def _on_save_retry(self, msg: str) -> None:
-        """Update banner when save retries with ffmpeg."""
-        n = len(self._active_saves)
-        self.lbl_saving.setText(f"{S.SAVING_BANNER_TEMPLATE.format(n=n)} - {msg}")
-        self.lbl_saving.setVisible(True)
-
     # --- Slots --------------------------------------------------------------
 
+    def _prompt_project_info(self) -> bool:
+        """Show the project info dialog. Returns True if the user accepted.
+
+        Side effects on accept: updates ``_factory_id`` / ``_factory_name``,
+        refreshes the button label, and if the factory id actually changed
+        while a folder is already loaded, triggers a re-rename + rescan.
+        """
+        dlg = ProjectInfoDialog(
+            self,
+            initial_factory_id=self._factory_id or "",
+            initial_factory_name=self._factory_name or "",
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return False
+        new_id, new_name = dlg.values()
+        info_changed = (new_id != self._factory_id) or (new_name != self._factory_name)
+        self._factory_id = new_id
+        self._factory_name = new_name
+        self.btn_project_info.setText(
+            S.BTN_PROJECT_INFO_TEMPLATE.format(
+                factory_id=new_id, factory_name=new_name,
+            )
+        )
+        # The folder name embeds both factory_id and factory_name now, so a
+        # change in either should trigger a re-rename + rescan.
+        if info_changed and self._folder is not None:
+            self._prepare_and_scan_folder()
+        return True
+
+    def _on_project_info(self) -> None:
+        self._prompt_project_info()
+
     def _on_open_folder(self) -> None:
+        # Both buttons are clickable in any order — if the user hasn't filled
+        # project info yet, prompt for it now and chain into folder selection.
+        if self._factory_id is None:
+            if not self._prompt_project_info():
+                return
         start_dir = str(self._folder) if self._folder else str(Path.home())
         chosen = QFileDialog.getExistingDirectory(self, S.BTN_OPEN_FOLDER, start_dir)
         if not chosen:
@@ -509,7 +576,7 @@ class FileListView(QWidget):
         self._folder = Path(chosen)
         self.lbl_folder.setText(S.LABEL_FOLDER_PREFIX + str(self._folder))
         self.btn_export.setEnabled(True)
-        self._rescan_folder()
+        self._prepare_and_scan_folder()
 
     def _on_export_xlsx(self) -> None:
         if self._folder is None or self.model.rowCount() == 0:
@@ -518,9 +585,12 @@ class FileListView(QWidget):
             )
             return
 
-        # v0.5: default filename derives from the folder name; user can
-        # always change it in the save dialog.
-        default_stem = self._folder.name or "videos"
+        # Build a default filename. ``QFileDialog.getSaveFileName`` handles
+        # special characters fine on each platform — no need to scrub.
+        if self._factory_id and self._factory_name:
+            default_stem = f"{self._factory_id}_{self._factory_name}"
+        else:
+            default_stem = self._folder.name or "videos"
         default_path = str(self._folder / f"{default_stem}.xlsx")
 
         path_str, _ = QFileDialog.getSaveFileName(
@@ -537,8 +607,8 @@ class FileListView(QWidget):
 
         rows = [
             ExportRow(
-                video_number=_video_id_from_stem(r.path.stem),
-                process_name=r.process_name_from_filename,
+                video_number=_extract_video_number(r.path.stem),
+                process_name=(r.annotation.process_name if r.annotation else ""),
                 duration_text=_fmt_duration(r.duration_seconds),
             )
             for r in self.model._rows
@@ -555,6 +625,41 @@ class FileListView(QWidget):
             S.DLG_EXPORT_OK_TITLE,
             S.DLG_EXPORT_OK_TEMPLATE.format(count=len(rows), path=str(out_path)),
         )
+
+    def _prepare_and_scan_folder(self) -> None:
+        """Rename the folder + videos to the project pattern, then scan."""
+        assert self._folder is not None
+        assert self._factory_id is not None
+
+        # 1. Rename the folder itself to {factory_id}_{factory_name}.
+        new_folder, folder_err = rename_folder_to_project_pattern(
+            self._folder, self._factory_id, self._factory_name or "",
+        )
+        if folder_err is not None:
+            QMessageBox.warning(
+                self,
+                S.FOLDER_RENAME_FAIL_TITLE,
+                S.FOLDER_RENAME_FAIL_TEMPLATE.format(
+                    target=f"{self._factory_id}_{self._factory_name or ''}",
+                    reason=folder_err,
+                ),
+            )
+        if new_folder != self._folder:
+            self._folder = new_folder
+            self.lbl_folder.setText(S.LABEL_FOLDER_PREFIX + str(self._folder))
+
+        # 2. Rename the videos inside.
+        _, errors = rename_videos_to_factory_pattern(self._folder, self._factory_id)
+        if errors:
+            lines = "\n".join(f"  · {p.name}: {msg}" for p, msg in errors)
+            QMessageBox.warning(
+                self,
+                S.RENAME_WARNING_TITLE,
+                S.RENAME_WARNING_TEMPLATE.format(lines=lines),
+            )
+
+        # 3. List the (now-renamed) folder.
+        self._rescan_folder()
 
     def _rescan_folder(self) -> None:
         assert self._folder is not None
@@ -615,8 +720,6 @@ class FileListView(QWidget):
             return
         if row.status == S.STATUS_SCANNING:
             return  # avoid opening while we're still figuring out current state
-        if row.path in self._active_saves:
-            return  # save in flight — file may be renamed any moment
         self.video_double_clicked.emit(row.path)
 
     def _refresh_counts_label(self) -> None:
@@ -681,26 +784,35 @@ class FileListView(QWidget):
             self.paste_to_unannotated.emit(row.path, parts)
             return
 
-        # Annotated target: keep its Process Name, replace parts, queue a
-        # background save through the same path AnnotateWindow uses.
-        self.request_save(
-            row.path,
-            Annotation(
-                process_name=row.annotation.process_name,
-                parts_involved=parts,
-            ),
+        # Annotated target: keep its Process Name, replace parts, save in the
+        # background. We don't need a file-lock dance here because nothing in
+        # the file list view holds an open handle on the file.
+        if row.path in self._active_saves:
+            return  # already saving this file
+        new_anno = Annotation(
+            process_name=row.annotation.process_name,
+            parts_involved=parts,
         )
+        row_idx = self.model.find_row_by_path(row.path)
+        if row_idx >= 0:
+            self.model.update_row_status(row_idx, S.STATUS_SAVING, row.annotation)
+            self._refresh_counts_label()
 
-    def _on_save_finished(
+        thread = QThread(self)
+        worker = _PasteSaveWorker(row.path, new_anno, self._factory_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_paste_save_finished)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._active_saves[row.path] = (thread, worker)
+        thread.start()
+
+    def _on_paste_save_finished(
         self, video_path: Path, final_path: Path, err: object,
     ) -> None:
         self._active_saves.pop(video_path, None)
-        self._update_saving_banner()
-
-        # Notify that save completed (for AnnotateWindow to update banner)
-        if err is None:
-            self.save_completed.emit(video_path)
-
         if err is not None:
             QMessageBox.critical(self, S.DLG_SAVE_FAIL_TITLE, str(err))
         # If the file was also renamed (process-name suffix), the row's path
